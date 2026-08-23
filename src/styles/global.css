@@ -417,20 +417,35 @@ del {
   text-align: center;
 }
 
-.beaver {
-  display: block;
+.term-art {
   margin: 0 auto;
-  width: max-content;
-  max-width: 100%;
-  overflow: auto;
+  text-align: center;
+}
+
+.term-prompt {
+  margin: 0;
   color: var(--ink);
-  font-family: "Computer Modern Typewriter", "CMU Typewriter Text",
-    ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
-  font-size: 0.68rem;
+  font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Monaco,
+    Consolas, "Courier New", monospace;
+  font-size: 0.72rem;
   font-style: normal;
   font-weight: 400;
-  line-height: 1.15;
-  letter-spacing: 0.04em;
+  letter-spacing: 0;
+}
+
+.term-sprite {
+  display: block;
+  margin: 0.7rem auto 0;
+  width: max-content;
+  max-width: 100%;
+  overflow-x: auto;
+  font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Monaco,
+    Consolas, "Courier New", monospace;
+  font-size: 0.78rem;
+  font-style: normal;
+  font-weight: 400;
+  line-height: 1.02;
+  letter-spacing: 0;
   text-align: left;
   user-select: none;
 }
