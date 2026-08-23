@@ -409,15 +409,34 @@ del {
 
 .site-footer {
   margin-top: 2.6rem;
-  padding-top: 0.45rem;
+  padding-top: 1.15rem;
   border-top: 0.7px solid var(--rule);
   color: var(--ink-soft);
   font-size: 0.88rem;
   font-style: italic;
+  text-align: center;
 }
 
-.site-footer p {
-  margin: 0.35rem 0 0;
+.beaver {
+  display: block;
+  margin: 0 auto;
+  width: max-content;
+  max-width: 100%;
+  overflow: auto;
+  color: var(--ink);
+  font-family: "Computer Modern Typewriter", "CMU Typewriter Text",
+    ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  font-size: 0.68rem;
+  font-style: normal;
+  font-weight: 400;
+  line-height: 1.15;
+  letter-spacing: 0.04em;
+  text-align: left;
+  user-select: none;
+}
+
+.footer-copy {
+  margin: 0.95rem 0 0;
 }
 
 .footer-links {
