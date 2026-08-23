@@ -439,6 +439,7 @@ del {
   width: max-content;
   max-width: 100%;
   overflow-x: auto;
+  color: var(--ink);
   font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Monaco,
     Consolas, "Courier New", monospace;
   font-size: 0.78rem;
