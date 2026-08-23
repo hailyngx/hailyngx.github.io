@@ -433,19 +433,19 @@ del {
   letter-spacing: 0;
 }
 
-.term-emoji {
-  margin: 0.55rem 0 0;
+.term-pixel {
+  display: block;
+  margin: 0.7rem auto 0;
+  width: 192px;
+  height: 120px;
   overflow: hidden;
-  color: var(--ink);
-  font-size: 3.4rem;
-  font-style: normal;
-  line-height: 1;
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
   user-select: none;
-  filter: grayscale(1) contrast(1.15) brightness(0);
 }
 
-html[data-theme="night"] .term-emoji {
-  filter: grayscale(1) contrast(1.15) brightness(0) invert(1);
+html[data-theme="night"] .term-pixel {
+  filter: invert(1);
 }
 
 .footer-copy {
