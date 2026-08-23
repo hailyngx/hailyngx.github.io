@@ -12,7 +12,7 @@ const server = http.createServer((req, res) => {
       method: req.method,
       headers: {
         ...req.headers,
-        host: "blog.haily.yevklnekqt:4321",
+        host: "haily.yevklnekqt.blog:4321",
       },
     },
     (upstream) => {
@@ -35,5 +35,5 @@ server.on("error", (error) => {
 });
 
 server.listen(LISTEN_PORT, "127.0.0.1", () => {
-  console.log("http://blog.haily.yevklnekqt -> 127.0.0.1:" + TARGET_PORT);
+  console.log("http://haily.yevklnekqt.blog -> 127.0.0.1:" + TARGET_PORT);
 });

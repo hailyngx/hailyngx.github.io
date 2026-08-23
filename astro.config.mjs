@@ -3,7 +3,7 @@ import remarkMath from "remark-math";
 import rehypeKatex from "rehype-katex";
 
 export default defineConfig({
-  site: "https://hailyngx.github.io",
+  site: "https://haily.yevklnekqt.blog",
   markdown: {
     remarkPlugins: [remarkMath],
     rehypePlugins: [rehypeKatex],
@@ -15,8 +15,8 @@ export default defineConfig({
   vite: {
     server: {
       allowedHosts: [
-        "blog.haily.yevklnekqt",
-        "haily.yevklnekqt",
+        "haily.yevklnekqt.blog",
+        "yevklnekqt.blog",
         "hailyngx.github.io",
         "localhost",
         "127.0.0.1",

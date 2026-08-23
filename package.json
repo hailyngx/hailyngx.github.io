@@ -7,11 +7,11 @@
     "node": ">=18.20.8"
   },
   "scripts": {
-    "dev": "bash scripts/with-node.sh astro dev --host blog.haily.yevklnekqt --port 4321",
+    "dev": "bash scripts/with-node.sh astro dev --host haily.yevklnekqt.blog --port 4321",
     "dev:local": "bash scripts/with-node.sh astro dev --port 4321",
     "build": "bash scripts/with-node.sh astro build",
-    "preview": "bash scripts/with-node.sh astro preview --host blog.haily.yevklnekqt --port 4321",
-    "open": "open http://blog.haily.yevklnekqt",
+    "preview": "bash scripts/with-node.sh astro preview --host haily.yevklnekqt.blog --port 4321",
+    "open": "open https://haily.yevklnekqt.blog",
     "listen80": "node scripts/port80.mjs"
   },
   "dependencies": {

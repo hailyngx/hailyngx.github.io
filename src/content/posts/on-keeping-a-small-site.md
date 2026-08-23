@@ -12,7 +12,7 @@ open, a place to put a sentence before it evaporates.
 
 This one is intentionally small. Two or three notes, a short about page, type
 that is comfortable to read. If it stays that way, that is fine. If it grows,
-it can grow from here — still at blog.haily.yevklnekqt.
+it can grow from here — still at haily.yevklnekqt.blog.
 
 ## On length
 
