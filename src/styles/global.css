@@ -436,8 +436,8 @@ del {
 .term-pixel {
   display: block;
   margin: 0.7rem auto 0;
-  width: 192px;
-  height: 120px;
+  width: 128px;
+  height: 80px;
   overflow: hidden;
   image-rendering: pixelated;
   image-rendering: crisp-edges;
