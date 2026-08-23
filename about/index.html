@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content="Haily Nguyen, engineer at Nuro." />
+    <meta name="color-scheme" content="light dark" />
+    <title>About · haily.yevklnekqt.blog</title>
+    <script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("theme");
+          var theme =
+            stored === "day" || stored === "night"
+              ? stored
+              : window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "night"
+                : "day";
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "day");
+        }
+      })();
+    </script>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/dreampulse/computer-modern-web-font@master/fonts.css" />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="site-header">
+        <div class="wordmark-lockup">
+          <a class="portrait-link" href="/haily.png" data-portrait-open>
+            <img class="portrait" src="/haily.png" width="640" height="640" alt="Haily Nguyen" />
+          </a>
+          <a class="wordmark" href="/">haily nguyen</a>
+        </div>
+        <div class="header-tools">
+          <nav class="nav" aria-label="Primary">
+            <a href="/">Notes</a>
+            <a href="/about" aria-current="page">About</a>
+          </nav>
+          <button class="theme-toggle" type="button" data-theme-toggle>🌙</button>
+        </div>
+      </header>
+      <header class="page-head">
+        <h1 class="page-title">About</h1>
+      </header>
+      <section class="abstract" aria-label="Abstract">
+        <span class="abstract-label">Abstract</span>
+        <p>
+          I’m an engineer who would rather ship the code than stand at the bench
+          all day, so the hardware stays within arm’s reach and I stay in the
+          chair. I work at Nuro — self-driving cars, imagine Waymo,
+          except we do the software stack and then make it talk to a bunch of
+          automotive and platform partners. When autonomy falls short, we put
+          the car back on the road. We call it waypointing, which is a cute
+          name for <s>remote control</s> “please do not stay stuck in a parking
+          lot.”
+        </p>
+        <p>
+          Day to day that is cameras, live streaming, real-time comms, networks,
+          simulation, making GPU clusters compatible and actually fast. A ton of
+          stuff meshed together so a safety-critical system stays extremely
+          reliable and low-latency when precision matters so, so much.
+        </p>
+      </section>
+      <footer class="site-footer">
+        <div class="term-art">
+          <p class="term-prompt">haily@yevklnekqt:~$ ./beaver</p>
+          <img class="term-pixel" src="/beaver.png?v=solid" width="64" height="40" alt="" />
+        </div>
+        <p class="footer-copy">
+          © 2026 Haily Nguyen
+          <span class="footer-links">
+            <a href="https://github.com/hailyngx" target="_blank" rel="noreferrer">GitHub</a>
+            <a href="https://www.linkedin.com/in/haily-nguyen/" target="_blank" rel="noreferrer">LinkedIn</a>
+          </span>
+        </p>
+      </footer>
+    </div>
+    <script>
+      (function () {
+        var root = document.documentElement;
+        var button = document.querySelector("[data-theme-toggle]");
+        if (!button) return;
+        function label(theme) { return theme === "night" ? "☀️" : "🌙"; }
+        function currentTheme() { return root.getAttribute("data-theme") === "night" ? "night" : "day"; }
+        function apply(theme) {
+          root.setAttribute("data-theme", theme);
+          try { localStorage.setItem("theme", theme); } catch (e) {}
+          button.textContent = label(theme);
+          button.setAttribute("aria-label", theme === "night" ? "Switch to day mode" : "Switch to night mode");
+        }
+        apply(currentTheme());
+        button.addEventListener("click", function () {
+          apply(currentTheme() === "night" ? "day" : "night");
+        });
+      })();
+    </script>
+    <div class="portrait-view" data-portrait-view hidden>
+      <img src="/haily.png" alt="Haily Nguyen" />
+    </div>
+    <script>
+      (function () {
+        var openLink = document.querySelector("[data-portrait-open]");
+        var view = document.querySelector("[data-portrait-view]");
+        if (!openLink || !view) return;
+        openLink.addEventListener("click", function (event) {
+          event.preventDefault();
+          view.hidden = false;
+        });
+        view.addEventListener("click", function () { view.hidden = true; });
+        document.addEventListener("keydown", function (event) {
+          if (event.key === "Escape") view.hidden = true;
+        });
+      })();
+    </script>
+  </body>
+</html>
