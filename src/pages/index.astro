@@ -1,0 +1,53 @@
+---
+import { getCollection } from "astro:content";
+import BaseLayout from "../layouts/BaseLayout.astro";
+
+const posts = (await getCollection("posts")).sort(
+  (a, b) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf()
+);
+
+const formatDate = (date: Date) =>
+  date.toLocaleDateString("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  });
+---
+
+<BaseLayout title="blog.haily.yevklnekqt" current="home">
+  <header class="masthead">
+    <p class="journal-name">Welcome to my blog</p>
+    <h1>Notes</h1>
+  </header>
+
+  <section class="abstract" aria-label="Abstract">
+    <span class="abstract-label">Abstract</span>
+    <p>
+      Hi, I’m Haily! Brain dump. <s>A professional personal brand.</s> I typically try a bunch of things at once and
+      get genuinely annoyed if I am only doing one — I love the juggle —
+      while also being in serious, dire need of touching grass.
+      Work sanded that down. I am crawling back to that version of myself.
+    </p>
+    <p>
+      If I really like you as a friend, I will put trivial money on a
+      ridiculous bet. I stay convicted. I want a future where the thing I
+      believe gets stress-tested, constantly, and does not get a free pass
+      because I like it.
+    </p>
+  </section>
+
+  <h2 class="section-label">Contents</h2>
+  <ol class="toc">
+    {
+      posts.map((post, index) => (
+        <li>
+          <a href={`/posts/${post.id}`}>
+            <span class="toc-num">{index + 1}.</span>
+            <span class="toc-title">{post.data.title}</span>
+            <span class="toc-date">{formatDate(post.data.pubDate)}</span>
+          </a>
+        </li>
+      ))
+    }
+  </ol>
+</BaseLayout>

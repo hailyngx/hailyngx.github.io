@@ -1,0 +1,145 @@
+---
+import "../styles/global.css";
+
+interface Props {
+  title: string;
+  description?: string;
+  current?: "home" | "about";
+}
+
+const { title, description = "Notes from Haily Nguyen.", current } = Astro.props;
+const siteName = "haily nguyen";
+---
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="description" content={description} />
+    <meta name="color-scheme" content="light dark" />
+    <title>{title}</title>
+    <script is:inline>
+      (function () {
+        try {
+          var stored = localStorage.getItem("theme");
+          var theme =
+            stored === "day" || stored === "night"
+              ? stored
+              : window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "night"
+                : "day";
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "day");
+        }
+      })();
+    </script>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/gh/dreampulse/computer-modern-web-font@master/fonts.css"
+    />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css"
+    />
+  </head>
+  <body>
+    <div class="wrap">
+      <header class="site-header">
+        <div class="wordmark-lockup">
+          {
+            (current === "home" || current === "about") && (
+              <a class="portrait-link" href="/haily.png" data-portrait-open>
+                <img
+                  class="portrait"
+                  src="/haily.png"
+                  width="640"
+                  height="640"
+                  alt="Haily Nguyen"
+                />
+              </a>
+            )
+          }
+          <a class="wordmark" href="/">{siteName}</a>
+        </div>
+        <div class="header-tools">
+          <nav class="nav" aria-label="Primary">
+            <a href="/" aria-current={current === "home" ? "page" : undefined}>Notes</a>
+            <a href="/about" aria-current={current === "about" ? "page" : undefined}>About</a>
+          </nav>
+          <button class="theme-toggle" type="button" data-theme-toggle>
+            🌙
+          </button>
+        </div>
+      </header>
+      <slot />
+      <footer class="site-footer">
+        <p>
+          {siteName}
+          <span class="footer-links">
+            <a href="https://github.com/hailyngx" target="_blank" rel="noreferrer">GitHub</a>
+            <a href="https://www.linkedin.com/in/haily-nguyen/" target="_blank" rel="noreferrer">LinkedIn</a>
+          </span>
+        </p>
+      </footer>
+    </div>
+    <div class="portrait-view" data-portrait-view hidden>
+      <img src="/haily.png" alt="Haily Nguyen" />
+    </div>
+    <script is:inline>
+      (function () {
+        var root = document.documentElement;
+        var button = document.querySelector("[data-theme-toggle]");
+        if (!button) return;
+
+        function label(theme) {
+          return theme === "night" ? "☀️" : "🌙";
+        }
+
+        function currentTheme() {
+          return root.getAttribute("data-theme") === "night" ? "night" : "day";
+        }
+
+        function apply(theme) {
+          root.setAttribute("data-theme", theme);
+          try {
+            localStorage.setItem("theme", theme);
+          } catch (e) {}
+          button.textContent = label(theme);
+          button.setAttribute(
+            "aria-label",
+            theme === "night" ? "Switch to day mode" : "Switch to night mode"
+          );
+        }
+
+        apply(currentTheme());
+        button.addEventListener("click", function () {
+          apply(currentTheme() === "night" ? "day" : "night");
+        });
+      })();
+    </script>
+    <script is:inline>
+      (function () {
+        var openLink = document.querySelector("[data-portrait-open]");
+        var view = document.querySelector("[data-portrait-view]");
+        if (!openLink || !view) return;
+
+        function openView(event) {
+          event.preventDefault();
+          view.hidden = false;
+        }
+
+        function closeView() {
+          view.hidden = true;
+        }
+
+        openLink.addEventListener("click", openView);
+        view.addEventListener("click", closeView);
+        document.addEventListener("keydown", function (event) {
+          if (event.key === "Escape") closeView();
+        });
+      })();
+    </script>
+  </body>
+</html>

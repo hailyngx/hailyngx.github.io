@@ -1,0 +1,22 @@
+{
+  "name": "haily-yevklnekqt",
+  "type": "module",
+  "version": "0.0.1",
+  "private": true,
+  "engines": {
+    "node": ">=18.20.8"
+  },
+  "scripts": {
+    "dev": "bash scripts/with-node.sh astro dev --host blog.haily.yevklnekqt --port 4321",
+    "dev:local": "bash scripts/with-node.sh astro dev --port 4321",
+    "build": "bash scripts/with-node.sh astro build",
+    "preview": "bash scripts/with-node.sh astro preview --host blog.haily.yevklnekqt --port 4321",
+    "open": "open http://blog.haily.yevklnekqt",
+    "listen80": "node scripts/port80.mjs"
+  },
+  "dependencies": {
+    "astro": "^5.13.0",
+    "rehype-katex": "^7.0.1",
+    "remark-math": "^6.0.0"
+  }
+}
