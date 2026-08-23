@@ -433,22 +433,19 @@ del {
   letter-spacing: 0;
 }
 
-.term-sprite {
-  display: block;
-  margin: 0.7rem auto 0;
-  width: max-content;
-  max-width: 100%;
-  overflow-x: auto;
+.term-emoji {
+  margin: 0.55rem 0 0;
+  overflow: hidden;
   color: var(--ink);
-  font-family: ui-monospace, "SFMono-Regular", "SF Mono", Menlo, Monaco,
-    Consolas, "Courier New", monospace;
-  font-size: 0.78rem;
+  font-size: 3.4rem;
   font-style: normal;
-  font-weight: 400;
-  line-height: 1.02;
-  letter-spacing: 0;
-  text-align: left;
+  line-height: 1;
   user-select: none;
+  filter: grayscale(1) contrast(1.15) brightness(0);
+}
+
+html[data-theme="night"] .term-emoji {
+  filter: grayscale(1) contrast(1.15) brightness(0) invert(1);
 }
 
 .footer-copy {
