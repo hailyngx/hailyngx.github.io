@@ -77,6 +77,8 @@ Roughly: hundreds of millions of monthly actives, ~10 calendar opens a day, a co
 
 The hard part is not disk. It's **range queries over recurrence** and **fan-out when the organizer edits**.
 
+Those two are the scale pass. I do not add a load balancer, extra API machines, a split database, a queue, or a cache because a template said to. I add a box when it attacks one of those bottlenecks — or the fact that one Postgres cannot hold hundreds of millions of people.
+
 ---
 
 ## The API that is the product
@@ -177,17 +179,19 @@ Timezone means `America/Los_Angeles`, not "minus eight hours." The repeating rul
 
 ## A picture of the system
 
-I start with something I could draw in a few minutes. Writes stay on the home shard. Anything that crosses users is async or scatter-gather. No distributed transaction.
+I start with something I could draw in a few minutes: the *core* — API, expander, one Postgres, one transaction. Writes stay on the home shard. Anything that crosses users is async or scatter-gather. No distributed transaction.
 
 [![High-level design of a Google Calendar–like system: clients, API, expander, sharded Postgres, and async fan-out](/calendar-design.png?v=3000)](/calendar-design.png?v=3000)
 
-I would start on **Postgres**. Something like Cassandra — a database built for huge keyed writes, weaker transactions — is a later conversation, if someone is actually pushing scale.
+Then the scale pass, given the number above. More than one API machine, so a load balancer. More than one Postgres, so a shard map and a connection waiting room. A queue so Alice's save does not wait for 200 copies. A cache only if the same March is opened all day. Search and busy-bits sit off the month-view path on purpose.
+
+I would start on **Postgres**. Something like Cassandra — a database built for huge keyed writes, weaker transactions — is a later conversation, if someone is actually pushing scale. I want one transaction for "delete this series and its exceptions." That is the rationale. Scale by splitting calendars, not by switching storage brands in minute two.
 
 ---
 
 ## A tour of every box
 
-This is the part I wish someone had written for me. Same order as the sketch.
+This is the part I wish someone had written for me. Same order as the sketch. I'll say when a box is the scale pass and when it is just the product.
 
 ### Clients
 
@@ -197,9 +201,11 @@ That's why the server returns *instances* (Tuesday 9am this week), not a raw rep
 
 ### HTTPS, CDN, load balancer
 
+This is the first scale pass, and it is boring on purpose.
+
 HTTPS is encrypted HTTP. The API is just `GET` / `POST` / `PATCH`.
 
-Encryption ends at the edge. A CDN caches JS and images, not events. A load balancer takes one public URL and spreads 10,000 phones across many API machines. None of this is the interesting part; it's the front door.
+Encryption ends at the edge. A CDN caches JS and images, not events — static files are the same for everyone; Alice's March is not. A load balancer takes one public URL and spreads tens of thousands of calendar opens across many API machines. One process cannot take that, and I do not want one process to be the only way in. None of this is the interesting part; it's the front door.
 
 ### API gateway, login, permissions
 
@@ -210,7 +216,7 @@ The gateway is the API front door: logged in? too many requests? which `calendar
 
 ### Calendar API (stateless)
 
-The program that implements range query, writes, RSVP, find-a-time. Stateless means any box can handle any request. Alice's March view does not live in one machine's RAM. Events live in Postgres. I can add API boxes when traffic grows.
+The program that implements range query, writes, RSVP, find-a-time. Stateless means any box can handle any request. Alice's March view does not live in one machine's RAM. Events live in Postgres. This is the scale pass for the API layer: cloning a stateless program is cheap; cloning the data is not. I add API boxes when traffic grows.
 
 ### Share list, again, on the request path
 
@@ -246,7 +252,7 @@ RSVP is yes / no / maybe on *my* copy. I cannot change the title from Bob's phon
 
 ### Shards and the home shard
 
-Postgres is the system of record. One instance cannot hold every calendar at this scale — CPU, disk I/O, vacuum, connections.
+This is the scale pass for storage. Postgres is the system of record. One instance cannot hold every calendar at this scale — CPU, disk, vacuum, connections. The rationale for splitting at all is that number, not fashion.
 
 A **shard** is one slice of the data on its own Postgres. I split by `calendar_id`. All of Alice's work calendar — events, exceptions, share list, her reminders — lives on one machine. That machine is the **home shard** for that calendar.
 
@@ -254,7 +260,9 @@ Create / edit / delete is then one database transaction: all succeed or all fail
 
 Alice's calendar → shard A. Bob's → shard B. A meeting Alice organizes is *born* on A. A copy is later written to B.
 
-Sharding by `event_id` would make "show March" hit every machine. Starting unsharded is fine. I'd shard when disk or vacuum start to hurt.
+Sharding by `event_id` would make "show March" hit every machine — the range-query bottleneck, made worse. Starting unsharded is fine. I'd shard when disk or vacuum start to hurt.
+
+I'd also index `(calendar_id, first_start)` on that shard. That is the cheap scale pass for "open March": a range on one machine, not a scan, and not Redis yet.
 
 ### Logical shards vs physical machines
 
@@ -278,7 +286,7 @@ My code computes something like `hash(calendar_id) % 480` and opens a connection
 
 ### PgBouncer
 
-PgBouncer is **not a database**. It does not store events. It is a waiting room for connections.
+Scale pass for connections, not for data. PgBouncer is **not a database**. It does not store events. It is a waiting room for connections.
 
 Each Postgres connection costs memory. 100 API servers × 50 connections × 96 shards is a connection storm. Postgres hits `max_connections` and falls over.
 
@@ -311,9 +319,7 @@ An "every Tuesday" rule is a generator, not a list of dates.
 
 ### The expander
 
-This is application code. Not a database. Not a message queue.
-
-Postgres cannot answer "which Tuesdays in March 2026, 9am Pacific, skipping the cancelled one, after daylight saving?" The expander turns a rule into meetings in a window.
+This is not a scale box. This is correctness. Postgres cannot answer "which Tuesdays in March 2026, 9am Pacific, skipping the cancelled one, after daylight saving?" The expander turns a rule into meetings in a window. Scale would be caching that output if we open the same March all day — later, under Redis.
 
 **Input:** series rows, exception rows, `timeMin`, `timeMax`.  
 **Output:** a flat list the UI can draw.
@@ -339,7 +345,7 @@ If I COMMIT then publish to the queue and the publish fails, Bob never gets the 
 
 ### A durable queue
 
-A log of messages. Alice saving a meeting stays fast. Updating 200 attendee copies is slow and retryable, so it happens after.
+This is the scale pass for the *second* bottleneck: fan-out. A log of messages. Alice saving a meeting stays fast. Updating 200 attendee copies is slow and retryable, so it happens after. The rationale is write latency, not "we need a queue."
 
 **Month view does not read the queue.** If a GET for March goes through a queue, I overdesigned the read path. Any boring queue is fine if nobody cares about the brand.
 
@@ -369,7 +375,7 @@ The outbox is enough for invite fan-out. Tailing the diary is how I'd keep searc
 
 ### Busy-bitmap
 
-A projection, not the source of truth. For each person, something like 14 days × 15-minute slots: 0 free, 1 busy.
+This is the scale pass for find-a-time when the attendee list is large. A projection, not the source of truth. For each person, something like 14 days × 15-minute slots: 0 free, 1 busy.
 
 Find-a-time for 20 people shouldn't expand 20 repeating rules on every keystroke. A few seconds of staleness might suggest a slot that just got booked. **Booking** still writes the real event with a version check. For 20 people, asking each calendar is fine. I'd name the bitmap at 200.
 
@@ -406,11 +412,9 @@ The organizer shard owns title and time. Bob's copy owns Bob's color.
 
 ### Hot tenants
 
-One giant calendar — US Holidays, company PTO — can starve everyone else on that machine.
+Still the scale pass. One giant calendar — US Holidays, company PTO — can starve everyone else on that machine. Hashing random ids spreads *keys*. It does not spread *load*. That's the rationale for isolating it instead of hoping the hash is fair.
 
 I'd isolate that logical shard on its own box, let subscribers store a **pointer + share list** instead of ten million copies, and send month views to a read replica (read-only Postgres, slightly behind). Writes stay on the primary.
-
-Hashing random ids spreads *keys*. It does not spread *load*.
 
 ### Moving to shards without a night of downtime
 
@@ -485,7 +489,7 @@ Company-wide room finding is a different product. Recurrence in find-a-time stil
 
 ## Where I'd use Redis (and where I wouldn't)
 
-Yes — as a cache. Never as the calendar.
+This is the rest of the scale pass for reads. The expander is correct; it is also CPU. If the same week is opened ten times a day, I should not re-expand "every Tuesday" from scratch every time. Redis is that shortcut. Never the calendar.
 
 If Redis restarts, March still has to be right. That's how I know events don't belong there.
 
@@ -537,6 +541,8 @@ I wouldn't open this design with a key-value store as the system of record, or w
 ---
 
 ## Trade-offs I keep coming back to
+
+The scale pass is just these choices with a number attached. Each line is a decision I already made, and why I would not flip it in minute one.
 
 | Question | Where I am |
 |---|---|
