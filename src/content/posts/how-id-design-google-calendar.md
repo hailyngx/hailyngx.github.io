@@ -1,6 +1,6 @@
 ---
 title: "How I'd design Google Calendar, part 1"
-description: "A calendar looks simple until a weekly standup has to survive daylight saving. How I'd shard it, expand RRULEs, and keep Kafka off the month-view path."
+description: "A calendar looks simple until a weekly standup has to survive daylight saving. How I'd shard it, expand recurrence rules, and keep Kafka off the month-view path."
 pubDate: 2026-08-23
 tags:
   - systems
@@ -8,9 +8,9 @@ tags:
 
 I spent a while working through a calendar as a backend problem — the kind of system that looks simple until you invite three people to a weekly standup that survives daylight saving.
 
-This is the design I landed on. I'm writing it down as notes I'd actually share: what the product is, how the data is shaped, how a request walks through the boxes, and why I wouldn't put Kafka on the month-view path.
+This is the design I landed on. I'm writing it down as notes I'd actually share: what the product is, how the data is shaped, how a request walks through the boxes, and why I wouldn't put Kafka (a durable queue of messages) on the month-view path.
 
-A lot of the storage thinking is influenced by how products like [Notion](https://www.notion.com/blog/sharding-postgres-at-notion) shard Postgres by workspace, [re-shard without downtime](https://www.notion.com/blog/the-great-re-shard), and treat [blocks as one recursive data model](https://www.notion.com/blog/data-model-behind-notion). A calendar isn't a Notion doc, but the instincts transfer: pick a partition key, keep related rows on one host, and don't pretend a hash of UUIDs is a uniform *load*.
+A lot of the storage thinking is influenced by how products like [Notion](https://www.notion.com/blog/sharding-postgres-at-notion) shard Postgres by workspace, [re-shard without downtime](https://www.notion.com/blog/the-great-re-shard), and treat [blocks as one recursive data model](https://www.notion.com/blog/data-model-behind-notion). A calendar isn't a Notion doc, but the instincts transfer: pick a partition key (the id you split data on), keep related rows on one host, and don't pretend a hash of random ids is a uniform *load*.
 
 ---
 
@@ -32,19 +32,19 @@ I'd leave out, unless someone really wanted them: video conferencing, rooms as a
 A few product questions hide most of the difficulty:
 
 **Single user or invites?**  
-If it's only my dentist appointments, I don't need copies or fan-out. The interesting product is multi-attendee: Alice creates a review, Bob and Cara RSVP, and a time change has to show up on *their* calendars.
+If it's only my dentist appointments, I don't need copies or fan-out (writing the meeting onto each attendee's calendar). The interesting product is multi-attendee: Alice creates a review, Bob and Cara RSVP, and a time change has to show up on *their* calendars.
 
 **Recurring events?**  
-If every event is one-off, I store start and end and go home. Recurrence means I store a *rule* ("every Tuesday 9am") and generate Tuesdays when someone opens March — plus exceptions when they move one of them.
+If every event is one-off, I store start and end and go home. Recurrence means I store a *rule* ("every Tuesday 9am") and generate Tuesdays when someone opens March — plus exceptions when they move one of them. That rule is an **RRULE** (recurrence rule), from the iCalendar standard Google Calendar already speaks. `FREQ=WEEKLY;BYDAY=TU` means "every Tuesday." It is not a list of dates.
 
-**Timezones, all-day, DST?**  
-I store which timezone the event lives in. I don't pretend everything is a UTC timestamp. All-day "March 1" is a calendar date, not midnight UTC (which is still February in Los Angeles). DST is why "add seven days in UTC" puts a meeting on the wrong Tuesday.
+**Timezones, all-day, DST (daylight saving time)?**  
+I store which timezone the event lives in. I don't pretend everything is a UTC timestamp (the one global clock). All-day "March 1" is a calendar date, not midnight UTC (which is still February in Los Angeles). Daylight saving is why "add seven days in UTC" puts a meeting on the wrong Tuesday.
 
 **Sharing: titles or only busy bars?**  
 Same `GET /events`, different payload. A manager with free/busy access sees that I'm busy 2–3pm, not "Interview at OpenAI."
 
 **Realtime?**  
-If someone moves the 3pm while I have the week open, I'd push "this calendar changed" and let the client refetch. I would not build Google-Docs-style OT/CRDT. Two people editing one event: version check, 409, reload.
+If someone moves the 3pm while I have the week open, I'd push "this calendar changed" and let the client refetch. I would not build Google-Docs-style OT/CRDT (the merge algorithms for two people typing in one paragraph). Two people editing one event: version check, HTTP 409 (conflict — your copy is stale), reload.
 
 Non-negotiables I'd write on the board:
 
@@ -59,7 +59,13 @@ P0 here just means: the product is lying about when you have to be somewhere.
 
 In the US, most zones spring forward and fall back. `America/Los_Angeles` is UTC−8 in winter and UTC−7 in summer. Users want **Tuesday 9:00 on the wall in San Francisco**, every week. `start + 168 hours` in UTC is "every seven 24-hour days." When the offset changes, 9:00 Pacific is a different UTC instant — and naive math can slip the instance onto Monday evening or 8:00am.
 
-The fix is boring: store `dtstart` + `tzid = America/Los_Angeles` + an RRULE, and expand with a timezone database. Local time stays Tuesday 9:00. UTC is allowed to move.
+The fix is boring. Store three things, then expand them with a timezone database:
+
+- **`dtstart`** — when the first instance starts, in local time.
+- **`tzid`** — timezone id, an IANA name like `America/Los_Angeles`. That id stays "Pacific time" even when the UTC offset flips (`UTC−8` in winter, `UTC−7` in summer). An offset is not a timezone.
+- **RRULE** — the recurrence rule (`FREQ=WEEKLY;BYDAY=TU`).
+
+Local time stays Tuesday 9:00. UTC is allowed to move.
 
 ---
 
@@ -67,7 +73,7 @@ The fix is boring: store `dtstart` + `tzid = America/Los_Angeles` + an RRULE, an
 
 I wouldn't invent cluster sizes. I'd name the bottleneck.
 
-Roughly: hundreds of millions of monthly actives, ~10 calendar opens a day, a couple of edits. Reads land around tens of thousands of QPS; writes are smaller. A month view is 50–200 *expanded* instances, not 50–200 series rows.
+Roughly: hundreds of millions of monthly actives, ~10 calendar opens a day, a couple of edits. Reads land around tens of thousands of QPS (queries per second); writes are smaller. A month view is 50–200 *expanded* instances, not 50–200 series rows.
 
 The hard part is not disk. It's **range queries over recurrence** and **fan-out when the organizer edits**.
 
@@ -75,7 +81,7 @@ The hard part is not disk. It's **range queries over recurrence** and **fan-out 
 
 ## The API that is the product
 
-REST is fine. Almost every endpoint is CRUD. The one I would actually defend is the range query:
+REST (HTTP `GET` / `POST` / `PATCH`) is fine. Almost every endpoint is CRUD (create, read, update, delete). The one I would actually defend is the range query:
 
 ```
 GET  /calendars
@@ -132,15 +138,15 @@ CalendarAcl
 EventSeries                    -- the rule
   id, calendar_id
   title, description
-  dtstart, dtend_offset
-  tzid                         -- "America/Los_Angeles"
-  rrule                        -- FREQ=WEEKLY;BYDAY=TU
+  dtstart, dtend_offset        -- first start + duration
+  tzid                         -- timezone id: "America/Los_Angeles"
+  rrule                        -- recurrence rule: FREQ=WEEKLY;BYDAY=TU
   until / count
   organizer_user_id
 
 EventException                 -- one cancelled or moved occurrence
   series_id
-  original_start               -- RECURRENCE-ID
+  original_start               -- which Tuesday (iCalendar RECURRENCE-ID)
   type                         -- cancelled | modified
   patched_fields...
 
@@ -154,7 +160,7 @@ Reminder
   event_id OR series_id, user_id, offset_min, method
 ```
 
-**ACL** is just the share list — who can do what on this calendar. I put it on the calendar, not on every event.
+**ACL** (access control list) is just the share list — who can do what on this calendar. I put it on the calendar, not on every event.
 
 | Role | What they can do | What they see |
 |---|---|---|
@@ -165,6 +171,8 @@ Reminder
 
 The invariant I keep repeating: a series is a **generator**. A range query expands the RRULE into the window, then applies exceptions. I persist the rule + exceptions, not the infinite instance list.
 
+Those field names again, in one place: **`tzid`** is the timezone the event lives in (`America/Los_Angeles`, not `UTC−8`). **`rrule`** is the repeating pattern. **`dtstart`** is the first occurrence. **`original_start`** is "that Tuesday," even if you dragged it to 11am.
+
 ---
 
 ## A picture of the system
@@ -173,7 +181,7 @@ I start with something I could draw in a few minutes. Writes stay on the home sh
 
 [![High-level design of a Google Calendar–like system: clients, API, expander, sharded Postgres, and async fan-out](/calendar-design.png?v=3000)](/calendar-design.png?v=3000)
 
-I would start on **Postgres**. A wide-column store is a later conversation, if someone is actually pushing scale.
+I would start on **Postgres**. A wide-column store (Cassandra, Bigtable — a different database shape for huge keyed writes, weaker transactions) is a later conversation, if someone is actually pushing scale.
 
 ---
 
@@ -197,7 +205,7 @@ TLS terminates at the edge. A CDN caches JS and images, not events. A load balan
 
 The gateway is the API front door: logged in? too many requests? which `calendar_id`?
 
-**AuthN** is *who are you?* (this JWT is Alice).  
+**AuthN** is *who are you?* (this login token is Alice).  
 **AuthZ** is *are you allowed?* (Alice can read Bob's calendar but not edit it). That's the ACL, not the login.
 
 ### Calendar API (stateless)
@@ -234,7 +242,7 @@ RSVP is yes / no / maybe on *my* copy. I cannot change the title from Bob's phon
 
 **freeBusy** returns busy intervals. **findTime** asks: Alice, Bob, Cara need 30 minutes this week — which gaps work? I fetch each busy list, intersect free slots with working hours in each person's timezone, sweep endpoints, return top K.
 
-**Scatter-gather** means Bob's calendar may be on another Postgres. I fire N small freeBusy calls (or read a busy cache), then merge in memory. I do not `JOIN` across machines, and I do not 2PC-lock three calendars to suggest a slot.
+**Scatter-gather** means Bob's calendar may be on another Postgres. I fire N small freeBusy calls (or read a busy cache), then merge in memory. I do not `JOIN` across machines, and I do not 2PC-lock three calendars to suggest a slot. (2PC is two-phase commit: try to make two databases commit as one. I refuse it later.)
 
 ### Shards and the home shard
 
@@ -246,7 +254,7 @@ Create / edit / delete is then one database transaction: all succeed or all fail
 
 Alice's calendar → shard A. Bob's → shard B. A meeting Alice organizes is *born* on A. A copy is later written to B.
 
-Sharding by `event_id` would make "show March" hit every machine. Starting unsharded is fine. I'd shard when IOPS or vacuum start to hurt.
+Sharding by `event_id` would make "show March" hit every machine. Starting unsharded is fine. I'd shard when IOPS (disk operations per second) or vacuum start to hurt.
 
 ### Logical shards vs physical machines
 
@@ -355,7 +363,7 @@ Cross-shard is async. No 2PC.
 
 ### CDC, Debezium, WAL
 
-The WAL is Postgres's diary of every change. CDC (often Debezium) tails that diary into Kafka so search, busy-bitmaps, and a data lake see *all* writes — including ones a script made — not only the ones the API remembered to publish.
+The WAL (write-ahead log) is Postgres's diary of every change. CDC (change data capture, often via Debezium) tails that diary into Kafka so search, busy-bitmaps, and a data lake see *all* writes — including ones a script made — not only the ones the API remembered to publish.
 
 Outbox-only is enough for invite fan-out. CDC is how I'd keep search honest.
 
@@ -420,7 +428,7 @@ If I ever had to leave a monolith:
 
 **Alice opens March**
 
-1. Phone → load balancer → gateway checks JWT.  
+1. Phone → load balancer → gateway checks the login token.  
 2. ACL: she's the owner.  
 3. Shard map: `alice-work` → shard A.  
 4. PgBouncer hands a reused connection to A.  
@@ -469,7 +477,7 @@ I already picked copies for a Google-like product and pointers for a page-embedd
 
 ### Find-a-time
 
-Same expand as the month view, clip to the window, merge overlaps. Cache `freebusy:{calendar_id}:{day}` with a short TTL and delete it on write.
+Same expand as the month view, clip to the window, merge overlaps. Cache `freebusy:{calendar_id}:{day}` with a short TTL (time-to-live, then the cache expires) and delete it on write.
 
 Company-wide room finding is a different product. Recurrence in find-a-time still expands only the search window.
 
@@ -491,7 +499,7 @@ If Redis restarts, March still has to be right. That's how I know events don't b
 
 After COMMIT I delete that calendar's `fb:*` and `month:*` (and publish). A 30–120s TTL is a backstop.
 
-I would **not** store RRULEs in Redis, lock a booking with a Redis lock (that's what `version` in Postgres is for), use a Redis list as an outbox, or make a giant ZSET the reminder system of record.
+I would **not** store RRULEs in Redis, lock a booking with a Redis lock (that's what `version` in Postgres is for), use a Redis list as an outbox, or make a giant ZSET (sorted set) the reminder system of record.
 
 How I'd say it: *Redis holds answers I've already computed. Postgres holds the rules that make those answers true.*
 
