@@ -171,7 +171,7 @@ The invariant I keep repeating: a series is a **generator**. A range query expan
 
 I start with something I could draw in a few minutes. Writes stay on the home shard. Anything that crosses users is async or scatter-gather. No distributed transaction.
 
-[![High-level design of a Google Calendar–like system: clients, API, expander, sharded Postgres, and async fan-out](/calendar-design.png)](/calendar-design.png)
+[![High-level design of a Google Calendar–like system: clients, API, expander, sharded Postgres, and async fan-out](/calendar-design.png?v=3000)](/calendar-design.png?v=3000)
 
 I would start on **Postgres**. A wide-column store is a later conversation, if someone is actually pushing scale.
 
