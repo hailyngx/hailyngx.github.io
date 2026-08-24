@@ -2,15 +2,17 @@
 import { getCollection } from "astro:content";
 import BaseLayout from "../layouts/BaseLayout.astro";
 
-const posts = (await getCollection("posts")).sort(
-  (a, b) => b.data.pubDate.valueOf() - a.data.pubDate.valueOf()
-);
+const posts = (await getCollection("posts")).sort((a, b) => {
+  const byDate = a.data.pubDate.valueOf() - b.data.pubDate.valueOf();
+  return byDate !== 0 ? byDate : a.id.localeCompare(b.id);
+});
 
 const formatDate = (date: Date) =>
   date.toLocaleDateString("en-US", {
     year: "numeric",
     month: "short",
     day: "numeric",
+    timeZone: "UTC",
   });
 ---
 
@@ -26,7 +28,10 @@ const formatDate = (date: Date) =>
       Hi, I’m Haily! Brain dump. <s>A professional personal brand.</s> I typically try a bunch of things at once and
       get genuinely annoyed if I am only doing one — I love the juggle —
       while also being in serious, dire need of touching grass.
-      Work sanded that down. I am crawling back to that version of myself.
+      Ever since I started working full time, that curious part of me sanded
+      down. I am crawling back to that version of myself. This is how I
+      distill what I read and synthesize it into knowledge that is supposed
+      to become mine.
     </p>
     <p>
       If I really like you as a friend, I will put trivial money on a

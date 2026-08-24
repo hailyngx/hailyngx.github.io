@@ -401,6 +401,68 @@ del {
   text-align: left;
 }
 
+.prose ul,
+.prose ol {
+  margin: 0.65rem 0 0.85rem 1.35rem;
+  padding: 0;
+  text-align: left;
+}
+
+.prose li {
+  margin: 0.18rem 0;
+}
+
+.prose li p {
+  text-indent: 0;
+}
+
+.prose hr {
+  border: 0;
+  border-top: 0.7px solid var(--rule-soft);
+  margin: 1.55rem 0;
+}
+
+.prose table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.95rem 0 1.1rem;
+  font-size: 0.9rem;
+  text-align: left;
+}
+
+.prose th,
+.prose td {
+  border-bottom: 0.7px solid var(--rule-soft);
+  padding: 0.32rem 0.55rem 0.32rem 0;
+  vertical-align: top;
+}
+
+.prose th {
+  font-weight: 700;
+}
+
+.prose p:has(> img),
+.prose p:has(> a > img) {
+  text-indent: 0;
+  margin: 1.25rem -0.4rem;
+}
+
+.prose img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 0.7px solid var(--rule-soft);
+  background: #f2f2f2;
+}
+
+@media (min-width: 860px) {
+  .prose p:has(> img),
+  .prose p:has(> a > img) {
+    width: calc(100% + 5.4rem);
+    margin-left: -2.7rem;
+  }
+}
+
 .prose .katex-display {
   margin: 1rem 0;
   overflow-x: auto;
