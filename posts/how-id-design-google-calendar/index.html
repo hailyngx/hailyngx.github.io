@@ -159,7 +159,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <hr>
 <h2 id="a-picture-of-the-system">A picture of the system</h2>
 <p>I start with something I could draw in a few minutes. Writes stay on the home shard. Anything that crosses users is async or scatter-gather. No distributed transaction.</p>
-<p><a href="/calendar-design.png"><img src="/calendar-design.png" alt="High-level design of a Google Calendar–like system: clients, API, expander, sharded Postgres, and async fan-out"></a></p>
+<p><a href="/calendar-design.png?v=3000"><img src="/calendar-design.png?v=3000" alt="High-level design of a Google Calendar–like system: clients, API, expander, sharded Postgres, and async fan-out"></a></p>
 <p>I would start on <strong>Postgres</strong>. A wide-column store is a later conversation, if someone is actually pushing scale.</p>
 <hr>
 <h2 id="a-tour-of-every-box">A tour of every box</h2>
