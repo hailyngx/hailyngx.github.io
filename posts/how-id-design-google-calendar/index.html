@@ -1,0 +1,590 @@
+<!DOCTYPE html><html lang="en"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="A calendar looks simple until a weekly standup has to survive daylight saving. How I'd shard it, expand RRULEs, and keep Kafka off the month-view path."><meta name="color-scheme" content="light dark"><title>How I&#39;d design Google Calendar, part 1 · haily.yevklnekqt.blog</title><script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("theme");
+          var theme =
+            stored === "day" || stored === "night"
+              ? stored
+              : window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "night"
+                : "day";
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "day");
+        }
+      })();
+    </script><link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/dreampulse/computer-modern-web-font@master/fonts.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css"><link rel="stylesheet" href="/_astro/about.E7T42uZN.css"></head> <body> <div class="wrap"> <header class="site-header"> <div class="wordmark-lockup">  <a class="wordmark" href="/">haily nguyen</a> </div> <div class="header-tools"> <nav class="nav" aria-label="Primary"> <a href="/">Notes</a> <a href="/about">About</a> </nav> <button class="theme-toggle" type="button" data-theme-toggle>
+🌙
+</button> </div> </header>  <article> <header class="article-header"> <h1>How I&#39;d design Google Calendar, part 1</h1> <p class="post-meta">August 23, 2026</p> </header> <div class="prose"> <p>I spent a while working through a calendar as a backend problem — the kind of system that looks simple until you invite three people to a weekly standup that survives daylight saving.</p>
+<p>This is the design I landed on. I’m writing it down as notes I’d actually share: what the product is, how the data is shaped, how a request walks through the boxes, and why I wouldn’t put Kafka on the month-view path.</p>
+<p>A lot of the storage thinking is influenced by how products like <a href="https://www.notion.com/blog/sharding-postgres-at-notion">Notion</a> shard Postgres by workspace, <a href="https://www.notion.com/blog/the-great-re-shard">re-shard without downtime</a>, and treat <a href="https://www.notion.com/blog/data-model-behind-notion">blocks as one recursive data model</a>. A calendar isn’t a Notion doc, but the instincts transfer: pick a partition key, keep related rows on one host, and don’t pretend a hash of UUIDs is a uniform <em>load</em>.</p>
+<hr>
+<h2 id="what-i-would-and-wouldnt-build">What I would and wouldn’t build</h2>
+<p>I’d start by locking the product. Otherwise I accidentally design three calendars.</p>
+<p>I’d include:</p>
+<ul>
+<li>Creating and listing events in a day / week / month window</li>
+<li>Recurring series, with “this event” / “this and following” / “all events”</li>
+<li>Invites and RSVP</li>
+<li>Free/busy and “find a time”</li>
+<li>Reminders</li>
+<li>Sharing a calendar as reader, writer, or free/busy-only</li>
+</ul>
+<p>I’d leave out, unless someone really wanted them: video conferencing, rooms as a full resource scheduler, and a notification bus the size of Gmail.</p>
+<p>A few product questions hide most of the difficulty:</p>
+<p><strong>Single user or invites?</strong><br>
+If it’s only my dentist appointments, I don’t need copies or fan-out. The interesting product is multi-attendee: Alice creates a review, Bob and Cara RSVP, and a time change has to show up on <em>their</em> calendars.</p>
+<p><strong>Recurring events?</strong><br>
+If every event is one-off, I store start and end and go home. Recurrence means I store a <em>rule</em> (“every Tuesday 9am”) and generate Tuesdays when someone opens March — plus exceptions when they move one of them.</p>
+<p><strong>Timezones, all-day, DST?</strong><br>
+I store which timezone the event lives in. I don’t pretend everything is a UTC timestamp. All-day “March 1” is a calendar date, not midnight UTC (which is still February in Los Angeles). DST is why “add seven days in UTC” puts a meeting on the wrong Tuesday.</p>
+<p><strong>Sharing: titles or only busy bars?</strong><br>
+Same <code>GET /events</code>, different payload. A manager with free/busy access sees that I’m busy 2–3pm, not “Interview at OpenAI.”</p>
+<p><strong>Realtime?</strong><br>
+If someone moves the 3pm while I have the week open, I’d push “this calendar changed” and let the client refetch. I would not build Google-Docs-style OT/CRDT. Two people editing one event: version check, 409, reload.</p>
+<p>Non-negotiables I’d write on the board:</p>
+<ul>
+<li>Reads dominate (month view). Writes are small.</li>
+<li>A wrong Tuesday after a clock change is worse than a 200ms slower month view.</li>
+<li>The grid should feel fresh in seconds, not minutes.</li>
+<li>Reminders can duplicate. Missing 9am cannot.</li>
+</ul>
+<h3 id="why-wrong-tuesday-after-dst-is-a-p0">Why “wrong Tuesday after DST” is a P0</h3>
+<p>P0 here just means: the product is lying about when you have to be somewhere.</p>
+<p>In the US, most zones spring forward and fall back. <code>America/Los_Angeles</code> is UTC−8 in winter and UTC−7 in summer. Users want <strong>Tuesday 9:00 on the wall in San Francisco</strong>, every week. <code>start + 168 hours</code> in UTC is “every seven 24-hour days.” When the offset changes, 9:00 Pacific is a different UTC instant — and naive math can slip the instance onto Monday evening or 8:00am.</p>
+<p>The fix is boring: store <code>dtstart</code> + <code>tzid = America/Los_Angeles</code> + an RRULE, and expand with a timezone database. Local time stays Tuesday 9:00. UTC is allowed to move.</p>
+<hr>
+<h2 id="the-one-number">The one number</h2>
+<p>I wouldn’t invent cluster sizes. I’d name the bottleneck.</p>
+<p>Roughly: hundreds of millions of monthly actives, ~10 calendar opens a day, a couple of edits. Reads land around tens of thousands of QPS; writes are smaller. A month view is 50–200 <em>expanded</em> instances, not 50–200 series rows.</p>
+<p>The hard part is not disk. It’s <strong>range queries over recurrence</strong> and <strong>fan-out when the organizer edits</strong>.</p>
+<hr>
+<h2 id="the-api-that-is-the-product">The API that is the product</h2>
+<p>REST is fine. Almost every endpoint is CRUD. The one I would actually defend is the range query:</p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>GET  /calendars</span></span>
+<span class="line"><span>GET  /calendars/{id}/events?timeMin=&#x26;timeMax=&#x26;expand=true</span></span>
+<span class="line"><span>POST /calendars/{id}/events</span></span>
+<span class="line"><span>PATCH /events/{id}?scope=this|thisAndFollowing|all</span></span>
+<span class="line"><span>POST /events/{id}/rsvp          {status: yes|no|maybe}</span></span>
+<span class="line"><span>POST /freeBusy                  {calendarIds, timeMin, timeMax}</span></span>
+<span class="line"><span>POST /events:findTime           {attendees, duration, window}</span></span></code></pre>
+<p>A calendar is not <code>SELECT * FROM events</code>. Most rows are rules. The client needs instances that <strong>overlap a window</strong>. So this endpoint is a windowed expand, not a table dump.</p>
+<p>Why each piece is there:</p>
+<ul>
+<li><strong><code>calendar_id</code> in the path</strong> — tenancy and shard key. I know which machine and which share list. “All events for these 50 users” is <code>freeBusy</code>, not this call.</li>
+<li><strong><code>timeMin</code> / <code>timeMax</code></strong> — required. Without a window I’d expand forever. I’d cap the window (a month view is ~31 days). Inclusive <code>timeMin</code>, exclusive <code>timeMax</code> is a fine convention.</li>
+<li><strong><code>expand=true</code></strong> — return concrete instances for the grid. <code>expand=false</code> is for sync/export: raw series + exceptions (Google’s <code>singleEvents=true</code> is the same idea).</li>
+<li><strong>Overlap, not “starts inside”</strong> — a meeting from Jan 31 11pm to Feb 1 1am belongs in both month views. The filter is <code>start &#x3C; timeMax AND end > timeMin</code>.</li>
+</ul>
+<p>What I would refuse: an unbounded <code>GET /events</code>, letting every client expand RRULEs (two phones, two DST bugs), or inserting ten years of Tuesday rows so <code>WHERE start BETWEEN</code> looks easy. “This and following” then becomes a 500-row rewrite.</p>
+<p>Identity in the response matters as much as the times:</p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="json"><code><span class="line"><span style="color:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#79B8FF">  "events"</span><span style="color:#E1E4E8">: [</span></span>
+<span class="line"><span style="color:#E1E4E8">    {</span></span>
+<span class="line"><span style="color:#79B8FF">      "id"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"series_abc_20260310T090000"</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">      "seriesId"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"abc"</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">      "originalStart"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"2026-03-10T09:00:00-07:00"</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">      "start"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"2026-03-10T09:00:00-07:00"</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">      "end"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"2026-03-10T10:00:00-07:00"</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">      "title"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"Standup"</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">      "isException"</span><span style="color:#E1E4E8">: </span><span style="color:#79B8FF">false</span></span>
+<span class="line"><span style="color:#E1E4E8">    }</span></span>
+<span class="line"><span style="color:#E1E4E8">  ]</span></span>
+<span class="line"><span style="color:#E1E4E8">}</span></span></code></pre>
+<p><code>originalStart</code> is “that Tuesday.” If I drag 9am → 11am, <code>start</code> changes and <code>originalStart</code> does not. That’s how the next edit still knows which occurrence I meant.</p>
+<hr>
+<h2 id="the-data-model-a-generator-not-a-pile-of-tuesdays">The data model: a generator, not a pile of Tuesdays</h2>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>Calendar</span></span>
+<span class="line"><span>  id, owner_user_id, tz, name</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>CalendarAcl</span></span>
+<span class="line"><span>  calendar_id, principal_id, role  -- owner | writer | reader | freebusy</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>EventSeries                    -- the rule</span></span>
+<span class="line"><span>  id, calendar_id</span></span>
+<span class="line"><span>  title, description</span></span>
+<span class="line"><span>  dtstart, dtend_offset</span></span>
+<span class="line"><span>  tzid                         -- "America/Los_Angeles"</span></span>
+<span class="line"><span>  rrule                        -- FREQ=WEEKLY;BYDAY=TU</span></span>
+<span class="line"><span>  until / count</span></span>
+<span class="line"><span>  organizer_user_id</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>EventException                 -- one cancelled or moved occurrence</span></span>
+<span class="line"><span>  series_id</span></span>
+<span class="line"><span>  original_start               -- RECURRENCE-ID</span></span>
+<span class="line"><span>  type                         -- cancelled | modified</span></span>
+<span class="line"><span>  patched_fields...</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>EventSingle                    -- non-recurring</span></span>
+<span class="line"><span>  id, calendar_id, start, end, tzid, ...</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>Attendee</span></span>
+<span class="line"><span>  event_id, user_id, status, comment</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>Reminder</span></span>
+<span class="line"><span>  event_id OR series_id, user_id, offset_min, method</span></span></code></pre>
+<p><strong>ACL</strong> is just the share list — who can do what on this calendar. I put it on the calendar, not on every event.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Role</th><th>What they can do</th><th>What they see</th></tr></thead><tbody><tr><td>owner</td><td>delete the calendar, change sharing</td><td>everything</td></tr><tr><td>writer</td><td>create / edit events</td><td>everything</td></tr><tr><td>reader</td><td>read only</td><td>titles and details</td></tr><tr><td>freebusy</td><td>read only</td><td>busy 2–3pm, no title</td></tr></tbody></table>
+<p>The invariant I keep repeating: a series is a <strong>generator</strong>. A range query expands the RRULE into the window, then applies exceptions. I persist the rule + exceptions, not the infinite instance list.</p>
+<hr>
+<h2 id="a-picture-of-the-system">A picture of the system</h2>
+<p>I start with something I could draw in a few minutes. Writes stay on the home shard. Anything that crosses users is async or scatter-gather. No distributed transaction.</p>
+<p><a href="/calendar-design.png"><img src="/calendar-design.png" alt="High-level design of a Google Calendar–like system: clients, API, expander, sharded Postgres, and async fan-out"></a></p>
+<p>I would start on <strong>Postgres</strong>. A wide-column store is a later conversation, if someone is actually pushing scale.</p>
+<hr>
+<h2 id="a-tour-of-every-box">A tour of every box</h2>
+<p>This is the part I wish someone had written for me. Same order as the sketch.</p>
+<h3 id="clients">Clients</h3>
+<p>Web, iOS, Android. They don’t store the real calendar. They paint what the server returns.</p>
+<p>That’s why the server returns <em>instances</em> (Tuesday 9am this week), not a raw RRULE. If each client expands recurrence, they will disagree after the first DST boundary.</p>
+<h3 id="https-cdn-load-balancer">HTTPS, CDN, load balancer</h3>
+<p>HTTPS is encrypted HTTP. REST is just <code>GET</code> / <code>POST</code> / <code>PATCH</code>.</p>
+<p>TLS terminates at the edge. A CDN caches JS and images, not events. A load balancer takes one public URL and spreads 10,000 phones across many API machines. None of this is the interesting part; it’s the front door.</p>
+<h3 id="api-gateway-authn-authz">API gateway, AuthN, AuthZ</h3>
+<p>The gateway is the API front door: logged in? too many requests? which <code>calendar_id</code>?</p>
+<p><strong>AuthN</strong> is <em>who are you?</em> (this JWT is Alice).<br>
+<strong>AuthZ</strong> is <em>are you allowed?</em> (Alice can read Bob’s calendar but not edit it). That’s the ACL, not the login.</p>
+<h3 id="calendar-api-stateless">Calendar API (stateless)</h3>
+<p>The program that implements range query, writes, RSVP, find-a-time. Stateless means any box can handle any request. Alice’s March view does not live in one machine’s RAM. Events live in Postgres. I can add API boxes when traffic grows.</p>
+<h3 id="acl-again-on-the-request-path">ACL, again, on the request path</h3>
+<p>Before I touch events I load <code>(caller, calendar_id)</code>:</p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>calendar_id | principal_id | role</span></span>
+<span class="line"><span>------------|--------------|----------</span></span>
+<span class="line"><span>alice-work  | alice        | owner</span></span>
+<span class="line"><span>alice-work  | bob          | reader</span></span>
+<span class="line"><span>alice-work  | manager      | freebusy</span></span></code></pre>
+<p>Manager hits the same range query. Role is <code>freebusy</code>. Titles get stripped. That’s how find-a-time stays polite.</p>
+<h3 id="range-query-write-rsvp-find-a-time">Range query, write, RSVP, find-a-time</h3>
+<p>The range query is “everything that overlaps this window, as instances.”</p>
+<p>Writes for a series take a <code>scope</code>:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>scope</th><th>English</th><th>What I store</th></tr></thead><tbody><tr><td>this</td><td>only this Tuesday</td><td>one exception row</td></tr><tr><td>all</td><td>every Tuesday</td><td>patch the series</td></tr><tr><td>thisAndFollowing</td><td>this Tuesday onward</td><td>split into two series</td></tr></tbody></table>
+<p>RSVP is yes / no / maybe on <em>my</em> copy. I cannot change the title from Bob’s phone. I write status on Bob’s shard and notify the organizer.</p>
+<p><strong>freeBusy</strong> returns busy intervals. <strong>findTime</strong> asks: Alice, Bob, Cara need 30 minutes this week — which gaps work? I fetch each busy list, intersect free slots with working hours in each person’s timezone, sweep endpoints, return top K.</p>
+<p><strong>Scatter-gather</strong> means Bob’s calendar may be on another Postgres. I fire N small freeBusy calls (or read a busy cache), then merge in memory. I do not <code>JOIN</code> across machines, and I do not 2PC-lock three calendars to suggest a slot.</p>
+<h3 id="shards-and-the-home-shard">Shards and the home shard</h3>
+<p>Postgres is the system of record. One instance cannot hold every calendar at this scale — CPU, disk I/O, vacuum, connections.</p>
+<p>A <strong>shard</strong> is one slice of the data on its own Postgres. I split by <code>calendar_id</code>. All of Alice’s work calendar — events, exceptions, ACL, her reminders — lives on one machine. That machine is the <strong>home shard</strong> for that calendar.</p>
+<p>Create / edit / delete is then one database transaction: all succeed or all fail. I never need a transaction across two buildings just to move my Tuesday.</p>
+<p>Alice’s calendar → shard A. Bob’s → shard B. A meeting Alice organizes is <em>born</em> on A. A copy is later written to B.</p>
+<p>Sharding by <code>event_id</code> would make “show March” hit every machine. Starting unsharded is fine. I’d shard when IOPS or vacuum start to hurt.</p>
+<h3 id="logical-shards-vs-physical-machines">Logical shards vs physical machines</h3>
+<p>A <strong>logical shard</strong> is a bucket — often a Postgres schema like <code>schema017.event_series</code>. You might have hundreds of them.</p>
+<p>A <strong>physical machine</strong> is the actual box. Five logical shards can sit on one host.</p>
+<p>Two levels means I can slide five schemas onto a new box when one host is hot, without changing how <code>calendar_id</code> hashes. Notion grew 32 machines to 96 by spreading the same 480 logical shards thinner. 480 has a lot of factors, so 32 → 40 → 48 hosts stays even. A power of two forces you to double.</p>
+<h3 id="the-shard-map-and-region">The shard map (and region)</h3>
+<p><code>calendar_id → (logical shard, physical host, region)</code>.</p>
+<p>The API has to know which Postgres to talk to. I keep that mapping in the <strong>application</strong>, not as a magic layer inside the database. An EU calendar gets <code>region = eu</code> and never leaves EU disks.</p>
+<p>If I skip the map I scan every database, or I hand routing to something like Citus. I want control over which rows travel together — event, exceptions, and ACL stay together because I put them together.</p>
+<h3 id="application-level-sharding">Application-level sharding</h3>
+<p>My code computes something like <code>hash(calendar_id) % 480</code> and opens a connection to that host. Packaged sharding (Citus, Vitess) hides that. I’d rather see the routing.</p>
+<h3 id="pgbouncer">PgBouncer</h3>
+<p>PgBouncer is <strong>not a database</strong>. It does not store events. It is a waiting room for connections.</p>
+<p>Each Postgres connection costs memory. 100 API servers × 50 connections × 96 shards is a connection storm. Postgres hits <code>max_connections</code> and falls over.</p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>1000 incoming app connections  →  PgBouncer  →  ~20 real connections per Postgres</span></span></code></pre>
+<p>When a query finishes, the slot goes to the next waiter. When you triple the number of databases, you also have to think about the pooler — Notion had to shard PgBouncer itself so a migration didn’t 3× connections to the <em>old</em> hosts.</p>
+<p>Analogy I use: 200 people, 10 teller windows. PgBouncer is the queue. Postgres is the vault. The expander is the teller doing math on your statement.</p>
+<h3 id="one-transaction">One transaction</h3>
+<p>A transaction is a bundle of SQL that all commits or all rolls back.</p>
+<p>“Delete this event and its exceptions and the outbox row” cannot leave orphans. Postgres transactions do not span two machines (unless I build two-phase commit, which I won’t). So anything that must stay consistent lives on the same shard.</p>
+<h3 id="whats-actually-in-those-tables">What’s actually in those tables</h3>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Table</th><th>Plain English</th></tr></thead><tbody><tr><td>Calendar</td><td>The container (“Alice / Work”) and default timezone</td></tr><tr><td>EventSingle</td><td>One-off: dentist Friday 3pm</td></tr><tr><td>EventSeries</td><td>The rule: every Tuesday 9am in Los Angeles</td></tr><tr><td>EventException</td><td>This Tuesday is cancelled, or it’s at 11am instead</td></tr><tr><td>CalendarAcl</td><td>The share list</td></tr><tr><td>Reminder</td><td>Notify me 10 minutes before — on <em>this user’s</em> copy</td></tr></tbody></table>
+<p>An RRULE like <code>FREQ=WEEKLY;BYDAY=TU</code> is a generator, not a list of dates.</p>
+<h3 id="the-expander">The expander</h3>
+<p>This is application code. Not a database. Not Kafka.</p>
+<p>Postgres cannot answer “which Tuesdays in March 2026, 9am Pacific, skipping the cancelled one, after DST?” The expander turns a rule into meetings in a window.</p>
+<p><strong>Input:</strong> series rows, exception rows, <code>timeMin</code>, <code>timeMax</code>.<br>
+<strong>Output:</strong> a flat list the UI can draw.</p>
+<p>Four steps:</p>
+<ol>
+<li><strong>Load candidates</strong> that could touch the window (<code>dtstart &#x3C; timeMax</code>, and <code>until</code> hasn’t already ended).</li>
+<li><strong>Expand in the timezone</strong> — Tuesdays 9:00 <code>America/Los_Angeles</code> in March, using a tz database, not <code>+ 7 days</code> in UTC.</li>
+<li><strong>Apply exceptions</strong> — drop cancelled <code>original_start</code>s; overlay moved ones.</li>
+<li><strong>Overlap filter</strong> — keep <code>start &#x3C; timeMax AND end > timeMin</code>.</li>
+</ol>
+<p>I run this in the API after SQL returns. Some diagrams hang it next to the shard because the <em>data</em> comes from the shard; the <em>CPU</em> is in the API.</p>
+<p>I don’t expand on the phone. I don’t pre-write ten years of Tuesdays. A bounded-horizon materialization (next 18 months) is an optional cache if free/busy QPS hurts. The source of truth stays the rule.</p>
+<p>Cost is O(instances in the window), not O(lifetime of the series). A weekly meeting for ten years is still four or five rows in March.</p>
+<h3 id="outbox">Outbox</h3>
+<p>A table in the <strong>same Postgres transaction</strong> as the event write. I insert the meeting and a row <code>EventUpdated {event_id, version: 1}</code> together.</p>
+<p>If I COMMIT then publish to Kafka and the publish fails, Bob never gets the invite. If I publish then crash before COMMIT, Bob has a ghost meeting. The outbox commits with the event. A worker publishes later. At-least-once is fine if the consumer is idempotent.</p>
+<h3 id="kafka-or-any-durable-queue">Kafka (or any durable queue)</h3>
+<p>A log of messages. Alice saving a meeting stays fast. Updating 200 attendee copies is slow and retryable, so it happens after.</p>
+<p><strong>Month view does not read Kafka.</strong> If a GET for March goes through a queue, I overdesigned the read path. SQS is fine if nobody cares about the brand.</p>
+<h3 id="fan-out-copies-idempotent-upsert">Fan-out, copies, idempotent upsert</h3>
+<p>Fan-out is mail merge: one organizer write, many attendee writes.</p>
+<p>Google’s model is <strong>copies</strong>. Bob gets his own row on his shard. He can add a private reminder and a color. When Alice changes the title, a worker overwrites the <em>shared</em> fields on that copy and leaves Bob’s reminder alone.</p>
+<p>The other model is a <strong>pointer</strong>: Bob only stores “I was invited to event X.” One source of truth, worse for offline and privacy. I’d use pointers for a v0 calendar inside a Notion page; copies for a consumer Google Calendar.</p>
+<p>The worker upserts with <code>(source_event_id, attendee_calendar_id, version)</code>. Running twice is the same as running once.</p>
+<h3 id="two-phase-commit--i-wouldnt">Two-phase commit — I wouldn’t</h3>
+<p>2PC tries to make two databases commit as one. If Bob’s shard is down, Alice couldn’t create a meeting. Slow, easy to deadlock.</p>
+<p>Instead: COMMIT on the home shard. The meeting exists. Fan-out eventually updates copies. Retry if B is down. Alice’s calendar is already correct.</p>
+<p>Cross-shard is async. No 2PC.</p>
+<h3 id="cdc-debezium-wal">CDC, Debezium, WAL</h3>
+<p>The WAL is Postgres’s diary of every change. CDC (often Debezium) tails that diary into Kafka so search, busy-bitmaps, and a data lake see <em>all</em> writes — including ones a script made — not only the ones the API remembered to publish.</p>
+<p>Outbox-only is enough for invite fan-out. CDC is how I’d keep search honest.</p>
+<h3 id="busy-bitmap">Busy-bitmap</h3>
+<p>A projection, not the source of truth. For each person, something like 14 days × 15-minute slots: 0 free, 1 busy.</p>
+<p>Find-a-time for 20 people shouldn’t expand 20 RRULEs on every keystroke. A few seconds of staleness might suggest a slot that just got booked. <strong>Booking</strong> still writes the real event with a version check. For N=20, scattering range queries is fine. I’d name the bitmap at N=200.</p>
+<h3 id="data-lake-and-search">Data lake and search</h3>
+<p>Cheap storage off the primary: analytics, “search my events,” embeddings. Not how I load March. I wouldn’t draw Spark unless the conversation is actually about analytics.</p>
+<h3 id="pubsub-and-websockets">Pub/Sub and WebSockets</h3>
+<p>After a write I publish <code>calendar abc changed</code>. A WebSocket is a long-lived connection so the open tab hears it without a refresh.</p>
+<p>I send an invalidate, not a collaborative op stream. OT and CRDTs are for two people typing in one paragraph. The wrong tool here.</p>
+<p>Polling every 30 seconds also works.</p>
+<h3 id="reminder-sweeper">Reminder sweeper</h3>
+<p>A small cron <strong>per shard</strong>: what fires in the next five minutes? For a series I expand the <em>next</em> occurrence, send one notification, then compute the following one.</p>
+<p>One delayed job per event does not scale. I accept duplicate pushes; I key them on <code>(reminder_id, fire_at)</code>. Bob’s “10 minutes before” lives on Bob’s copy.</p>
+<h3 id="cas-and-409">CAS and 409</h3>
+<p>Check-and-set: update this event only if <code>version</code> is still 4. If someone already wrote 5, fail. HTTP 409 means your view is stale — reload. Two tabs, or a find-a-time slot that got taken.</p>
+<h3 id="source-of-truth-vs-projection">Source of truth vs projection</h3>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th></th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>Source of truth</td><td>If a cache disagrees, the cache is wrong</td><td>Home-shard Postgres (series + exceptions)</td></tr><tr><td>Projection</td><td>Derived, rebuildable</td><td>Busy-bitmap, search, an attendee copy’s <em>shared</em> fields</td></tr></tbody></table>
+<p>The organizer shard owns title and time. Bob’s copy owns Bob’s color.</p>
+<h3 id="hot-tenants">Hot tenants</h3>
+<p>One giant calendar — US Holidays, company PTO — can starve everyone else on that machine.</p>
+<p>I’d isolate that logical shard on its own box, let subscribers store a <strong>pointer + ACL</strong> instead of ten million copies, and send month views to a read replica (read-only Postgres, slightly behind). Writes stay on the primary.</p>
+<p>Hashing UUIDs spreads <em>keys</em>. It does not spread <em>load</em>.</p>
+<h3 id="moving-to-shards-without-a-night-of-downtime">Moving to shards without a night of downtime</h3>
+<p>If I ever had to leave a monolith:</p>
+<ol>
+<li>Create logical shards first. Route in the app.</li>
+<li>Backfill old rows; tail new writes with an audit log or logical replication.</li>
+<li><strong>Dark reads</strong> — for a sample of traffic, query old and new, <em>serve the old</em>, log mismatches.</li>
+<li>Per shard: pause the pooler, wait until the replica is caught up, flip the map, <strong>reverse-replicate</strong> so I can roll back.</li>
+<li>Users might see a second of “Saving…”, not five minutes of an outage.</li>
+</ol>
+<hr>
+<h2 id="three-paths-through-the-system">Three paths through the system</h2>
+<p><strong>Alice opens March</strong></p>
+<ol>
+<li>Phone → load balancer → gateway checks JWT.</li>
+<li>ACL: she’s the owner.</li>
+<li>Shard map: <code>alice-work</code> → shard A.</li>
+<li>PgBouncer hands a reused connection to A.</li>
+<li>Postgres returns series and exceptions that might overlap March.</li>
+<li>The expander turns “every Tuesday 9am PT” into five March Tuesdays and drops the cancelled one.</li>
+<li>JSON goes back. The grid paints.</li>
+<li>Kafka was never touched.</li>
+</ol>
+<p><strong>Alice invites Bob</strong></p>
+<ol>
+<li>Same write path, but the COMMIT on A includes the event <em>and</em> an outbox row.</li>
+<li>Pub/sub tells Alice’s open tab to refetch.</li>
+<li>A worker reads the outbox and upserts a copy on Bob’s shard.</li>
+<li>Bob’s tab hears “calendar changed.”</li>
+</ol>
+<p>If Bob’s shard is down, the meeting still exists on A. The worker retries.</p>
+<p><strong>Find a time, then book</strong></p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>findTime → resolve each calendar → parallel freeBusy (or busy-bitmap)</span></span>
+<span class="line"><span>        → merge gaps ∩ working hours → top K</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>book    → CAS write on organizer home shard</span></span>
+<span class="line"><span>        → outbox fan-out</span></span>
+<span class="line"><span>        → 409 if the version moved, then findTime again</span></span></code></pre>
+<hr>
+<h2 id="the-hard-parts">The hard parts</h2>
+<h3 id="recurrence-edits">Recurrence edits</h3>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>User choice</th><th>What I do</th></tr></thead><tbody><tr><td>This event</td><td>One exception. Series unchanged.</td></tr><tr><td>All events</td><td>Patch the series. Keep exceptions unless they conflict.</td></tr><tr><td>This and following</td><td><strong>Split.</strong> Set <code>UNTIL</code> on the old series just before the split. Create a new series from that Tuesday. Move later exceptions onto the new id.</td></tr></tbody></table>
+<p>The split is the part I didn’t want to hand-wave. All-day stays a date in the event timezone, not a UTC midnight.</p>
+<h3 id="copies-vs-pointers">Copies vs pointers</h3>
+<p>I already picked copies for a Google-like product and pointers for a page-embedded calendar. Organizer is source of truth for shared fields. Last write wins with a version. Not a CRDT.</p>
+<h3 id="find-a-time">Find-a-time</h3>
+<p>Same expand as the month view, clip to the window, merge overlaps. Cache <code>freebusy:{calendar_id}:{day}</code> with a short TTL and delete it on write.</p>
+<p>Company-wide room finding is a different product. Recurrence in find-a-time still expands only the search window.</p>
+<hr>
+<h2 id="where-id-use-redis-and-where-i-wouldnt">Where I’d use Redis (and where I wouldn’t)</h2>
+<p>Yes — as a cache. Never as the calendar.</p>
+<p>If Redis restarts, March still has to be right. That’s how I know events don’t belong there.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>I’d put in Redis</th><th>Shape</th><th>If Redis dies</th></tr></thead><tbody><tr><td>Free/busy for a day</td><td><code>fb:{calendar_id}:{date}</code></td><td>Expand from Postgres</td></tr><tr><td>Busy bitmap for find-a-time</td><td>bits for ~14 days × 15 minutes</td><td>Rebuild from CDC, or scatter freeBusy</td></tr><tr><td>Optional expanded month</td><td><code>month:{calendar_id}:{yyyy-mm}</code></td><td>Run the expander</td></tr><tr><td>Pub/sub for “calendar changed”</td><td>channel <code>cal:{id}</code></td><td>Clients poll</td></tr><tr><td>Gateway rate limits</td><td><code>rl:{user_id}</code></td><td>Fail open or limit locally</td></tr></tbody></table>
+<p>After COMMIT I delete that calendar’s <code>fb:*</code> and <code>month:*</code> (and publish). A 30–120s TTL is a backstop.</p>
+<p>I would <strong>not</strong> store RRULEs in Redis, lock a booking with a Redis lock (that’s what <code>version</code> in Postgres is for), use a Redis list as an outbox, or make a giant ZSET the reminder system of record.</p>
+<p>How I’d say it: <em>Redis holds answers I’ve already computed. Postgres holds the rules that make those answers true.</em></p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>Calendar API</span></span>
+<span class="line"><span>    |  miss</span></span>
+<span class="line"><span>    +-- month / freeBusy --> Redis --hit--> client</span></span>
+<span class="line"><span>    |                         miss</span></span>
+<span class="line"><span>    +-- expander &#x3C;-- Postgres</span></span>
+<span class="line"><span>    +-- after COMMIT: DEL cache keys, PUBLISH cal:{id}</span></span></code></pre>
+<hr>
+<h2 id="sharding-if-i-think-like-a-datastore-team">Sharding, if I think like a datastore team</h2>
+<p>The partition key I’d defend is <strong><code>calendar_id</code></strong>. It’s the workspace-id move: month view, ACL, and almost every write stay on one host. Invites and find-a-time become the cross-shard problems — which is the interesting part.</p>
+<p><code>user_id</code> is nicer for “all my calendars” and per-user copies, and then every shared calendar fans out. <code>event_id</code> kills range queries.</p>
+<p>On the home shard, in one transaction:</p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>Calendar, EventSeries, EventException, CalendarAcl, local Reminders</span></span></code></pre>
+<p>Attendee copies live on the attendee’s shard. Organizer write → outbox → workers.</p>
+<p>A holiday calendar with ten million subscribers is the noisy neighbor. Isolate it, pointer+ACL instead of copies, read replicas for the grid, cache busy bits so a million opens don’t all hit primary.</p>
+<p>EU residency is the same map with a region column. Find-a-time across the Atlantic should see busy bits only, or refuse and book per region.</p>
+<p>I wouldn’t open this design with Dynamo as the system of record, or with a CRDT, or with Kafka in front of <code>GET /events</code>.</p>
+<hr>
+<h2 id="trade-offs-i-keep-coming-back-to">Trade-offs I keep coming back to</h2>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Question</th><th>Where I am</th></tr></thead><tbody><tr><td>Materialize vs expand</td><td>Expand on read for the UI. Materialize a horizon if free/busy QPS hurts.</td></tr><tr><td>Copy vs pointer</td><td>Copies for per-user privacy and sync. Pointers for a simple embedded calendar.</td></tr><tr><td>SQL vs something else</td><td>SQL until a single calendar is truly huge. Shard by <code>calendar_id</code>.</td></tr><tr><td>Realtime</td><td>Invalidate the open view. Don’t OT the event.</td></tr><tr><td>Idempotency</td><td>Client <code>request_id</code> on create; fan-out on <code>source_version</code>.</td></tr><tr><td>Calendar vs scheduler</td><td>Find-a-time is O(attendees × window). Rooms and constraints are another service.</td></tr><tr><td>Redis</td><td>Derived data only.</td></tr></tbody></table>
+<p>A few questions I like asking myself:</p>
+<ul>
+<li>Infinite weekly event, month view? Expand in the window. Apply exceptions.</li>
+<li>Move one instance, then edit the series? Exception stays keyed by <code>original_start</code>.</li>
+<li>Delete a series with 200 attendees? Soft-delete, fan-out cancel, sweeper skips.</li>
+<li>All-day March 1, organizer in SF, viewer in Tokyo? Date-only in the event timezone — not a UTC midnight shift.</li>
+<li>Two tabs? Version, 409, reload.</li>
+</ul>
+<p>A calendar inside a Notion workspace would reuse page ACL and the existing realtime channel. The event becomes a database row. The hard part doesn’t change: RRULE, exceptions, split.</p>
+<hr>
+<h2 id="one-request-end-to-end">One request, end to end</h2>
+<p>Alice opens March: auth, ACL, shard map, pooled connection, expand in Pacific time, draw the grid. No queue.</p>
+<p>Alice invites Bob: one transaction on her shard (event + outbox), then a worker writes his copy. If his database is down, she still has a meeting.</p>
+<p>That’s the system I wanted — a boring primary, an expander that respects wall clocks, and everything else allowed to be a little late.</p>
+<hr>
+<p><em>I leaned on Notion’s public writeups on <a href="https://www.notion.com/blog/sharding-postgres-at-notion">sharding Postgres</a>, <a href="https://www.notion.com/blog/the-great-re-shard">the re-shard</a>, the <a href="https://www.notion.com/blog/building-and-scaling-notions-data-lake">data lake</a>, <a href="https://www.notion.com/blog/enabling-multi-region-data-systems-at-notion">multi-region</a>, and the <a href="https://www.notion.com/blog/data-model-behind-notion">block data model</a>.</em></p> </div> </article>  <footer class="site-footer"> <div class="term-art"> <p class="term-prompt">haily@yevklnekqt:~$ ./beaver</p> <img class="term-pixel" src="/beaver.png?v=solid" width="64" height="40" alt=""> </div> <p class="footer-copy">
+© 2026 Haily Nguyen
+<span class="footer-links"> <a href="https://github.com/hailyngx" target="_blank" rel="noreferrer">GitHub</a> <a href="https://www.linkedin.com/in/haily-nguyen/" target="_blank" rel="noreferrer">LinkedIn</a> </span> </p> </footer> </div> <div class="portrait-view" data-portrait-view hidden> <img src="/haily.png" alt="Haily Nguyen"> </div> <script>
+      (function () {
+        var root = document.documentElement;
+        var button = document.querySelector("[data-theme-toggle]");
+        if (!button) return;
+
+        function label(theme) {
+          return theme === "night" ? "☀️" : "🌙";
+        }
+
+        function currentTheme() {
+          return root.getAttribute("data-theme") === "night" ? "night" : "day";
+        }
+
+        function apply(theme) {
+          root.setAttribute("data-theme", theme);
+          try {
+            localStorage.setItem("theme", theme);
+          } catch (e) {}
+          button.textContent = label(theme);
+          button.setAttribute(
+            "aria-label",
+            theme === "night" ? "Switch to day mode" : "Switch to night mode"
+          );
+        }
+
+        apply(currentTheme());
+        button.addEventListener("click", function () {
+          apply(currentTheme() === "night" ? "day" : "night");
+        });
+      })();
+    </script> <script>
+      (function () {
+        var openLink = document.querySelector("[data-portrait-open]");
+        var view = document.querySelector("[data-portrait-view]");
+        if (!openLink || !view) return;
+
+        function openView(event) {
+          event.preventDefault();
+          view.hidden = false;
+        }
+
+        function closeView() {
+          view.hidden = true;
+        }
+
+        openLink.addEventListener("click", openView);
+        view.addEventListener("click", closeView);
+        document.addEventListener("keydown", function (event) {
+          if (event.key === "Escape") closeView();
+        });
+      })();
+    </script> </body> </html>
