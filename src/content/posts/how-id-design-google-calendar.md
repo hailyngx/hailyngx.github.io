@@ -181,7 +181,7 @@ Timezone means `America/Los_Angeles`, not "minus eight hours." The repeating rul
 
 I start with something I could draw in a few minutes: the *core* — API, expander, one Postgres, one transaction. Writes stay on the home shard. Anything that crosses users is async or scatter-gather. No distributed transaction.
 
-[![High-level design of a Google Calendar–like system: clients, API, expander, sharded Postgres, and async fan-out](/calendar-design.png?v=3000)](/calendar-design.png?v=3000)
+[![High-level design of a Google Calendar–like system: clients, API, expander, sharded Postgres, and async fan-out](/images/calendar-design.png?v=3000)](/images/calendar-design.png?v=3000)
 
 Then the scale pass, given the number above. More than one API machine, so a load balancer. More than one Postgres, so a shard map and a connection waiting room. A queue so Alice's save does not wait for 200 copies. A cache only if the same March is opened all day. Search and busy-bits sit off the month-view path on purpose.
 
