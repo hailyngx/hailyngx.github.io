@@ -64,6 +64,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <p>I wouldn’t invent cluster sizes. I’d name the bottleneck.</p>
 <p>Roughly: hundreds of millions of monthly actives, ~10 calendar opens a day, a couple of edits. Reads land around tens of thousands of queries per second; writes are smaller. A month view is 50–200 <em>expanded</em> instances, not 50–200 series rows.</p>
 <p>The hard part is not disk. It’s <strong>range queries over recurrence</strong> and <strong>fan-out when the organizer edits</strong>.</p>
+<p>Those two are the scale pass. I do not add a load balancer, extra API machines, a split database, a queue, or a cache because a template said to. I add a box when it attacks one of those bottlenecks — or the fact that one Postgres cannot hold hundreds of millions of people.</p>
 <hr>
 <h2 id="the-api-that-is-the-product">The API that is the product</h2>
 <p>HTTP is fine. Almost every endpoint is create / read / update / delete. The one I would actually defend is the range query:</p>
@@ -165,24 +166,26 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <p>Timezone means <code>America/Los_Angeles</code>, not “minus eight hours.” The repeating rule is the pattern. First start is the first occurrence. <code>original_start</code> is “that Tuesday,” even if you dragged it to 11am.</p>
 <hr>
 <h2 id="a-picture-of-the-system">A picture of the system</h2>
-<p>I start with something I could draw in a few minutes. Writes stay on the home shard. Anything that crosses users is async or scatter-gather. No distributed transaction.</p>
+<p>I start with something I could draw in a few minutes: the <em>core</em> — API, expander, one Postgres, one transaction. Writes stay on the home shard. Anything that crosses users is async or scatter-gather. No distributed transaction.</p>
 <p><a href="/calendar-design.png?v=3000"><img src="/calendar-design.png?v=3000" alt="High-level design of a Google Calendar–like system: clients, API, expander, sharded Postgres, and async fan-out"></a></p>
-<p>I would start on <strong>Postgres</strong>. Something like Cassandra — a database built for huge keyed writes, weaker transactions — is a later conversation, if someone is actually pushing scale.</p>
+<p>Then the scale pass, given the number above. More than one API machine, so a load balancer. More than one Postgres, so a shard map and a connection waiting room. A queue so Alice’s save does not wait for 200 copies. A cache only if the same March is opened all day. Search and busy-bits sit off the month-view path on purpose.</p>
+<p>I would start on <strong>Postgres</strong>. Something like Cassandra — a database built for huge keyed writes, weaker transactions — is a later conversation, if someone is actually pushing scale. I want one transaction for “delete this series and its exceptions.” That is the rationale. Scale by splitting calendars, not by switching storage brands in minute two.</p>
 <hr>
 <h2 id="a-tour-of-every-box">A tour of every box</h2>
-<p>This is the part I wish someone had written for me. Same order as the sketch.</p>
+<p>This is the part I wish someone had written for me. Same order as the sketch. I’ll say when a box is the scale pass and when it is just the product.</p>
 <h3 id="clients">Clients</h3>
 <p>Web, iOS, Android. They don’t store the real calendar. They paint what the server returns.</p>
 <p>That’s why the server returns <em>instances</em> (Tuesday 9am this week), not a raw repeating rule. If each phone expands recurrence, they will disagree after the first daylight-saving boundary.</p>
 <h3 id="https-cdn-load-balancer">HTTPS, CDN, load balancer</h3>
+<p>This is the first scale pass, and it is boring on purpose.</p>
 <p>HTTPS is encrypted HTTP. The API is just <code>GET</code> / <code>POST</code> / <code>PATCH</code>.</p>
-<p>Encryption ends at the edge. A CDN caches JS and images, not events. A load balancer takes one public URL and spreads 10,000 phones across many API machines. None of this is the interesting part; it’s the front door.</p>
+<p>Encryption ends at the edge. A CDN caches JS and images, not events — static files are the same for everyone; Alice’s March is not. A load balancer takes one public URL and spreads tens of thousands of calendar opens across many API machines. One process cannot take that, and I do not want one process to be the only way in. None of this is the interesting part; it’s the front door.</p>
 <h3 id="api-gateway-login-permissions">API gateway, login, permissions</h3>
 <p>The gateway is the API front door: logged in? too many requests? which <code>calendar_id</code>?</p>
 <p><strong>Login</strong> is <em>who are you?</em> (this token is Alice).<br>
 <strong>Permissions</strong> is <em>are you allowed?</em> (Alice can read Bob’s calendar but not edit it). That’s the share list, not the login.</p>
 <h3 id="calendar-api-stateless">Calendar API (stateless)</h3>
-<p>The program that implements range query, writes, RSVP, find-a-time. Stateless means any box can handle any request. Alice’s March view does not live in one machine’s RAM. Events live in Postgres. I can add API boxes when traffic grows.</p>
+<p>The program that implements range query, writes, RSVP, find-a-time. Stateless means any box can handle any request. Alice’s March view does not live in one machine’s RAM. Events live in Postgres. This is the scale pass for the API layer: cloning a stateless program is cheap; cloning the data is not. I add API boxes when traffic grows.</p>
 <h3 id="share-list-again-on-the-request-path">Share list, again, on the request path</h3>
 <p>Before I touch events I load <code>(caller, calendar_id)</code>:</p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>calendar_id | principal_id | role</span></span>
@@ -224,11 +227,12 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <p><strong>freeBusy</strong> returns busy intervals. <strong>findTime</strong> asks: Alice, Bob, Cara need 30 minutes this week — which gaps work? I fetch each busy list, intersect free slots with working hours in each person’s timezone, sweep endpoints, return top K.</p>
 <p><strong>Scatter-gather</strong> means Bob’s calendar may be on another Postgres. I fire N small freeBusy calls (or read a busy cache), then merge in memory. I do not <code>JOIN</code> across machines, and I do not lock three calendars in one distributed commit just to suggest a slot.</p>
 <h3 id="shards-and-the-home-shard">Shards and the home shard</h3>
-<p>Postgres is the system of record. One instance cannot hold every calendar at this scale — CPU, disk I/O, vacuum, connections.</p>
+<p>This is the scale pass for storage. Postgres is the system of record. One instance cannot hold every calendar at this scale — CPU, disk, vacuum, connections. The rationale for splitting at all is that number, not fashion.</p>
 <p>A <strong>shard</strong> is one slice of the data on its own Postgres. I split by <code>calendar_id</code>. All of Alice’s work calendar — events, exceptions, share list, her reminders — lives on one machine. That machine is the <strong>home shard</strong> for that calendar.</p>
 <p>Create / edit / delete is then one database transaction: all succeed or all fail. I never need a transaction across two buildings just to move my Tuesday.</p>
 <p>Alice’s calendar → shard A. Bob’s → shard B. A meeting Alice organizes is <em>born</em> on A. A copy is later written to B.</p>
-<p>Sharding by <code>event_id</code> would make “show March” hit every machine. Starting unsharded is fine. I’d shard when disk or vacuum start to hurt.</p>
+<p>Sharding by <code>event_id</code> would make “show March” hit every machine — the range-query bottleneck, made worse. Starting unsharded is fine. I’d shard when disk or vacuum start to hurt.</p>
+<p>I’d also index <code>(calendar_id, first_start)</code> on that shard. That is the cheap scale pass for “open March”: a range on one machine, not a scan, and not Redis yet.</p>
 <h3 id="logical-shards-vs-physical-machines">Logical shards vs physical machines</h3>
 <p>A <strong>logical shard</strong> is a bucket — often a Postgres schema like <code>schema017.event_series</code>. You might have hundreds of them.</p>
 <p>A <strong>physical machine</strong> is the actual box. Five logical shards can sit on one host.</p>
@@ -240,7 +244,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <h3 id="application-level-sharding">Application-level sharding</h3>
 <p>My code computes something like <code>hash(calendar_id) % 480</code> and opens a connection to that host. Packaged sharding hides that. I’d rather see the routing.</p>
 <h3 id="pgbouncer">PgBouncer</h3>
-<p>PgBouncer is <strong>not a database</strong>. It does not store events. It is a waiting room for connections.</p>
+<p>Scale pass for connections, not for data. PgBouncer is <strong>not a database</strong>. It does not store events. It is a waiting room for connections.</p>
 <p>Each Postgres connection costs memory. 100 API servers × 50 connections × 96 shards is a connection storm. Postgres hits <code>max_connections</code> and falls over.</p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>1000 incoming app connections  →  PgBouncer  →  ~20 real connections per Postgres</span></span></code></pre>
 <p>When a query finishes, the slot goes to the next waiter. When you triple the number of databases, you also have to think about the pooler — Notion had to shard PgBouncer itself so a migration didn’t 3× connections to the <em>old</em> hosts.</p>
@@ -285,8 +289,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <table><thead><tr><th>Table</th><th>Plain English</th></tr></thead><tbody><tr><td>Calendar</td><td>The container (“Alice / Work”) and default timezone</td></tr><tr><td>EventSingle</td><td>One-off: dentist Friday 3pm</td></tr><tr><td>EventSeries</td><td>The rule: every Tuesday 9am in Los Angeles</td></tr><tr><td>EventException</td><td>This Tuesday is cancelled, or it’s at 11am instead</td></tr><tr><td>CalendarAcl</td><td>The share list</td></tr><tr><td>Reminder</td><td>Notify me 10 minutes before — on <em>this user’s</em> copy</td></tr></tbody></table>
 <p>An “every Tuesday” rule is a generator, not a list of dates.</p>
 <h3 id="the-expander">The expander</h3>
-<p>This is application code. Not a database. Not a message queue.</p>
-<p>Postgres cannot answer “which Tuesdays in March 2026, 9am Pacific, skipping the cancelled one, after daylight saving?” The expander turns a rule into meetings in a window.</p>
+<p>This is not a scale box. This is correctness. Postgres cannot answer “which Tuesdays in March 2026, 9am Pacific, skipping the cancelled one, after daylight saving?” The expander turns a rule into meetings in a window. Scale would be caching that output if we open the same March all day — later, under Redis.</p>
 <p><strong>Input:</strong> series rows, exception rows, <code>timeMin</code>, <code>timeMax</code>.<br>
 <strong>Output:</strong> a flat list the UI can draw.</p>
 <p>Four steps:</p>
@@ -303,7 +306,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <p>A table in the <strong>same Postgres transaction</strong> as the event write. I insert the meeting and a row <code>EventUpdated {event_id, version: 1}</code> together.</p>
 <p>If I COMMIT then publish to the queue and the publish fails, Bob never gets the invite. If I publish then crash before COMMIT, Bob has a ghost meeting. The outbox commits with the event. A worker publishes later. Delivering twice is fine if applying twice is the same as applying once.</p>
 <h3 id="a-durable-queue">A durable queue</h3>
-<p>A log of messages. Alice saving a meeting stays fast. Updating 200 attendee copies is slow and retryable, so it happens after.</p>
+<p>This is the scale pass for the <em>second</em> bottleneck: fan-out. A log of messages. Alice saving a meeting stays fast. Updating 200 attendee copies is slow and retryable, so it happens after. The rationale is write latency, not “we need a queue.”</p>
 <p><strong>Month view does not read the queue.</strong> If a GET for March goes through a queue, I overdesigned the read path. Any boring queue is fine if nobody cares about the brand.</p>
 <h3 id="fan-out-copies-idempotent-upsert">Fan-out, copies, idempotent upsert</h3>
 <p>Fan-out is mail merge: one organizer write, many attendee writes.</p>
@@ -318,7 +321,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <p>Postgres keeps a diary of every change. A capture tool can tail that diary into the queue so search, busy-bitmaps, and a data lake see <em>all</em> writes — including ones a script made — not only the ones the API remembered to publish.</p>
 <p>The outbox is enough for invite fan-out. Tailing the diary is how I’d keep search honest.</p>
 <h3 id="busy-bitmap">Busy-bitmap</h3>
-<p>A projection, not the source of truth. For each person, something like 14 days × 15-minute slots: 0 free, 1 busy.</p>
+<p>This is the scale pass for find-a-time when the attendee list is large. A projection, not the source of truth. For each person, something like 14 days × 15-minute slots: 0 free, 1 busy.</p>
 <p>Find-a-time for 20 people shouldn’t expand 20 repeating rules on every keystroke. A few seconds of staleness might suggest a slot that just got booked. <strong>Booking</strong> still writes the real event with a version check. For 20 people, asking each calendar is fine. I’d name the bitmap at 200.</p>
 <h3 id="data-lake-and-search">Data lake and search</h3>
 <p>Cheap storage off the primary: analytics, “search my events.” Not how I load March. I wouldn’t draw a data-processing cluster unless the conversation is actually about analytics.</p>
@@ -355,9 +358,8 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <table><thead><tr><th></th><th>Meaning</th><th>Example</th></tr></thead><tbody><tr><td>Source of truth</td><td>If a cache disagrees, the cache is wrong</td><td>Home-shard Postgres (series + exceptions)</td></tr><tr><td>Projection</td><td>Derived, rebuildable</td><td>Busy-bitmap, search, an attendee copy’s <em>shared</em> fields</td></tr></tbody></table>
 <p>The organizer shard owns title and time. Bob’s copy owns Bob’s color.</p>
 <h3 id="hot-tenants">Hot tenants</h3>
-<p>One giant calendar — US Holidays, company PTO — can starve everyone else on that machine.</p>
+<p>Still the scale pass. One giant calendar — US Holidays, company PTO — can starve everyone else on that machine. Hashing random ids spreads <em>keys</em>. It does not spread <em>load</em>. That’s the rationale for isolating it instead of hoping the hash is fair.</p>
 <p>I’d isolate that logical shard on its own box, let subscribers store a <strong>pointer + share list</strong> instead of ten million copies, and send month views to a read replica (read-only Postgres, slightly behind). Writes stay on the primary.</p>
-<p>Hashing random ids spreads <em>keys</em>. It does not spread <em>load</em>.</p>
 <h3 id="moving-to-shards-without-a-night-of-downtime">Moving to shards without a night of downtime</h3>
 <p>If I ever had to leave a monolith:</p>
 <ol>
@@ -428,7 +430,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <p>Company-wide room finding is a different product. Recurrence in find-a-time still expands only the search window.</p>
 <hr>
 <h2 id="where-id-use-redis-and-where-i-wouldnt">Where I’d use Redis (and where I wouldn’t)</h2>
-<p>Yes — as a cache. Never as the calendar.</p>
+<p>This is the rest of the scale pass for reads. The expander is correct; it is also CPU. If the same week is opened ten times a day, I should not re-expand “every Tuesday” from scratch every time. Redis is that shortcut. Never the calendar.</p>
 <p>If Redis restarts, March still has to be right. That’s how I know events don’t belong there.</p>
 
 
@@ -487,6 +489,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <p>I wouldn’t open this design with a key-value store as the system of record, or with live co-editing, or with a queue in front of <code>GET /events</code>.</p>
 <hr>
 <h2 id="trade-offs-i-keep-coming-back-to">Trade-offs I keep coming back to</h2>
+<p>The scale pass is just these choices with a number attached. Each line is a decision I already made, and why I would not flip it in minute one.</p>
 
 
 
