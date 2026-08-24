@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="A calendar looks simple until a weekly standup has to survive daylight saving. How I'd shard it, expand RRULEs, and keep Kafka off the month-view path."><meta name="color-scheme" content="light dark"><title>How I&#39;d design Google Calendar, part 1 · haily.yevklnekqt.blog</title><script>
+<!DOCTYPE html><html lang="en"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="A calendar looks simple until a weekly standup has to survive daylight saving. How I'd shard it, expand recurrence rules, and keep Kafka off the month-view path."><meta name="color-scheme" content="light dark"><title>How I&#39;d design Google Calendar, part 1 · haily.yevklnekqt.blog</title><script>
       (function () {
         try {
           var stored = localStorage.getItem("theme");
@@ -16,8 +16,8 @@
     </script><link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/dreampulse/computer-modern-web-font@master/fonts.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css"><link rel="stylesheet" href="/_astro/about.E7T42uZN.css"></head> <body> <div class="wrap"> <header class="site-header"> <div class="wordmark-lockup">  <a class="wordmark" href="/">haily nguyen</a> </div> <div class="header-tools"> <nav class="nav" aria-label="Primary"> <a href="/">Notes</a> <a href="/about">About</a> </nav> <button class="theme-toggle" type="button" data-theme-toggle>
 🌙
 </button> </div> </header>  <article> <header class="article-header"> <h1>How I&#39;d design Google Calendar, part 1</h1> <p class="post-meta">August 23, 2026</p> </header> <div class="prose"> <p>I spent a while working through a calendar as a backend problem — the kind of system that looks simple until you invite three people to a weekly standup that survives daylight saving.</p>
-<p>This is the design I landed on. I’m writing it down as notes I’d actually share: what the product is, how the data is shaped, how a request walks through the boxes, and why I wouldn’t put Kafka on the month-view path.</p>
-<p>A lot of the storage thinking is influenced by how products like <a href="https://www.notion.com/blog/sharding-postgres-at-notion">Notion</a> shard Postgres by workspace, <a href="https://www.notion.com/blog/the-great-re-shard">re-shard without downtime</a>, and treat <a href="https://www.notion.com/blog/data-model-behind-notion">blocks as one recursive data model</a>. A calendar isn’t a Notion doc, but the instincts transfer: pick a partition key, keep related rows on one host, and don’t pretend a hash of UUIDs is a uniform <em>load</em>.</p>
+<p>This is the design I landed on. I’m writing it down as notes I’d actually share: what the product is, how the data is shaped, how a request walks through the boxes, and why I wouldn’t put Kafka (a durable queue of messages) on the month-view path.</p>
+<p>A lot of the storage thinking is influenced by how products like <a href="https://www.notion.com/blog/sharding-postgres-at-notion">Notion</a> shard Postgres by workspace, <a href="https://www.notion.com/blog/the-great-re-shard">re-shard without downtime</a>, and treat <a href="https://www.notion.com/blog/data-model-behind-notion">blocks as one recursive data model</a>. A calendar isn’t a Notion doc, but the instincts transfer: pick a partition key (the id you split data on), keep related rows on one host, and don’t pretend a hash of random ids is a uniform <em>load</em>.</p>
 <hr>
 <h2 id="what-i-would-and-wouldnt-build">What I would and wouldn’t build</h2>
 <p>I’d start by locking the product. Otherwise I accidentally design three calendars.</p>
@@ -33,15 +33,15 @@
 <p>I’d leave out, unless someone really wanted them: video conferencing, rooms as a full resource scheduler, and a notification bus the size of Gmail.</p>
 <p>A few product questions hide most of the difficulty:</p>
 <p><strong>Single user or invites?</strong><br>
-If it’s only my dentist appointments, I don’t need copies or fan-out. The interesting product is multi-attendee: Alice creates a review, Bob and Cara RSVP, and a time change has to show up on <em>their</em> calendars.</p>
+If it’s only my dentist appointments, I don’t need copies or fan-out (writing the meeting onto each attendee’s calendar). The interesting product is multi-attendee: Alice creates a review, Bob and Cara RSVP, and a time change has to show up on <em>their</em> calendars.</p>
 <p><strong>Recurring events?</strong><br>
-If every event is one-off, I store start and end and go home. Recurrence means I store a <em>rule</em> (“every Tuesday 9am”) and generate Tuesdays when someone opens March — plus exceptions when they move one of them.</p>
-<p><strong>Timezones, all-day, DST?</strong><br>
-I store which timezone the event lives in. I don’t pretend everything is a UTC timestamp. All-day “March 1” is a calendar date, not midnight UTC (which is still February in Los Angeles). DST is why “add seven days in UTC” puts a meeting on the wrong Tuesday.</p>
+If every event is one-off, I store start and end and go home. Recurrence means I store a <em>rule</em> (“every Tuesday 9am”) and generate Tuesdays when someone opens March — plus exceptions when they move one of them. That rule is an <strong>RRULE</strong> (recurrence rule), from the iCalendar standard Google Calendar already speaks. <code>FREQ=WEEKLY;BYDAY=TU</code> means “every Tuesday.” It is not a list of dates.</p>
+<p><strong>Timezones, all-day, DST (daylight saving time)?</strong><br>
+I store which timezone the event lives in. I don’t pretend everything is a UTC timestamp (the one global clock). All-day “March 1” is a calendar date, not midnight UTC (which is still February in Los Angeles). Daylight saving is why “add seven days in UTC” puts a meeting on the wrong Tuesday.</p>
 <p><strong>Sharing: titles or only busy bars?</strong><br>
 Same <code>GET /events</code>, different payload. A manager with free/busy access sees that I’m busy 2–3pm, not “Interview at OpenAI.”</p>
 <p><strong>Realtime?</strong><br>
-If someone moves the 3pm while I have the week open, I’d push “this calendar changed” and let the client refetch. I would not build Google-Docs-style OT/CRDT. Two people editing one event: version check, 409, reload.</p>
+If someone moves the 3pm while I have the week open, I’d push “this calendar changed” and let the client refetch. I would not build Google-Docs-style OT/CRDT (the merge algorithms for two people typing in one paragraph). Two people editing one event: version check, HTTP 409 (conflict — your copy is stale), reload.</p>
 <p>Non-negotiables I’d write on the board:</p>
 <ul>
 <li>Reads dominate (month view). Writes are small.</li>
@@ -52,15 +52,21 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <h3 id="why-wrong-tuesday-after-dst-is-a-p0">Why “wrong Tuesday after DST” is a P0</h3>
 <p>P0 here just means: the product is lying about when you have to be somewhere.</p>
 <p>In the US, most zones spring forward and fall back. <code>America/Los_Angeles</code> is UTC−8 in winter and UTC−7 in summer. Users want <strong>Tuesday 9:00 on the wall in San Francisco</strong>, every week. <code>start + 168 hours</code> in UTC is “every seven 24-hour days.” When the offset changes, 9:00 Pacific is a different UTC instant — and naive math can slip the instance onto Monday evening or 8:00am.</p>
-<p>The fix is boring: store <code>dtstart</code> + <code>tzid = America/Los_Angeles</code> + an RRULE, and expand with a timezone database. Local time stays Tuesday 9:00. UTC is allowed to move.</p>
+<p>The fix is boring. Store three things, then expand them with a timezone database:</p>
+<ul>
+<li><strong><code>dtstart</code></strong> — when the first instance starts, in local time.</li>
+<li><strong><code>tzid</code></strong> — timezone id, an IANA name like <code>America/Los_Angeles</code>. That id stays “Pacific time” even when the UTC offset flips (<code>UTC−8</code> in winter, <code>UTC−7</code> in summer). An offset is not a timezone.</li>
+<li><strong>RRULE</strong> — the recurrence rule (<code>FREQ=WEEKLY;BYDAY=TU</code>).</li>
+</ul>
+<p>Local time stays Tuesday 9:00. UTC is allowed to move.</p>
 <hr>
 <h2 id="the-one-number">The one number</h2>
 <p>I wouldn’t invent cluster sizes. I’d name the bottleneck.</p>
-<p>Roughly: hundreds of millions of monthly actives, ~10 calendar opens a day, a couple of edits. Reads land around tens of thousands of QPS; writes are smaller. A month view is 50–200 <em>expanded</em> instances, not 50–200 series rows.</p>
+<p>Roughly: hundreds of millions of monthly actives, ~10 calendar opens a day, a couple of edits. Reads land around tens of thousands of QPS (queries per second); writes are smaller. A month view is 50–200 <em>expanded</em> instances, not 50–200 series rows.</p>
 <p>The hard part is not disk. It’s <strong>range queries over recurrence</strong> and <strong>fan-out when the organizer edits</strong>.</p>
 <hr>
 <h2 id="the-api-that-is-the-product">The API that is the product</h2>
-<p>REST is fine. Almost every endpoint is CRUD. The one I would actually defend is the range query:</p>
+<p>REST (HTTP <code>GET</code> / <code>POST</code> / <code>PATCH</code>) is fine. Almost every endpoint is CRUD (create, read, update, delete). The one I would actually defend is the range query:</p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>GET  /calendars</span></span>
 <span class="line"><span>GET  /calendars/{id}/events?timeMin=&#x26;timeMax=&#x26;expand=true</span></span>
 <span class="line"><span>POST /calendars/{id}/events</span></span>
@@ -103,15 +109,15 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <span class="line"><span>EventSeries                    -- the rule</span></span>
 <span class="line"><span>  id, calendar_id</span></span>
 <span class="line"><span>  title, description</span></span>
-<span class="line"><span>  dtstart, dtend_offset</span></span>
-<span class="line"><span>  tzid                         -- "America/Los_Angeles"</span></span>
-<span class="line"><span>  rrule                        -- FREQ=WEEKLY;BYDAY=TU</span></span>
+<span class="line"><span>  dtstart, dtend_offset        -- first start + duration</span></span>
+<span class="line"><span>  tzid                         -- timezone id: "America/Los_Angeles"</span></span>
+<span class="line"><span>  rrule                        -- recurrence rule: FREQ=WEEKLY;BYDAY=TU</span></span>
 <span class="line"><span>  until / count</span></span>
 <span class="line"><span>  organizer_user_id</span></span>
 <span class="line"><span></span></span>
 <span class="line"><span>EventException                 -- one cancelled or moved occurrence</span></span>
 <span class="line"><span>  series_id</span></span>
-<span class="line"><span>  original_start               -- RECURRENCE-ID</span></span>
+<span class="line"><span>  original_start               -- which Tuesday (iCalendar RECURRENCE-ID)</span></span>
 <span class="line"><span>  type                         -- cancelled | modified</span></span>
 <span class="line"><span>  patched_fields...</span></span>
 <span class="line"><span></span></span>
@@ -123,7 +129,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <span class="line"><span></span></span>
 <span class="line"><span>Reminder</span></span>
 <span class="line"><span>  event_id OR series_id, user_id, offset_min, method</span></span></code></pre>
-<p><strong>ACL</strong> is just the share list — who can do what on this calendar. I put it on the calendar, not on every event.</p>
+<p><strong>ACL</strong> (access control list) is just the share list — who can do what on this calendar. I put it on the calendar, not on every event.</p>
 
 
 
@@ -156,11 +162,12 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 
 <table><thead><tr><th>Role</th><th>What they can do</th><th>What they see</th></tr></thead><tbody><tr><td>owner</td><td>delete the calendar, change sharing</td><td>everything</td></tr><tr><td>writer</td><td>create / edit events</td><td>everything</td></tr><tr><td>reader</td><td>read only</td><td>titles and details</td></tr><tr><td>freebusy</td><td>read only</td><td>busy 2–3pm, no title</td></tr></tbody></table>
 <p>The invariant I keep repeating: a series is a <strong>generator</strong>. A range query expands the RRULE into the window, then applies exceptions. I persist the rule + exceptions, not the infinite instance list.</p>
+<p>Those field names again, in one place: <strong><code>tzid</code></strong> is the timezone the event lives in (<code>America/Los_Angeles</code>, not <code>UTC−8</code>). <strong><code>rrule</code></strong> is the repeating pattern. <strong><code>dtstart</code></strong> is the first occurrence. <strong><code>original_start</code></strong> is “that Tuesday,” even if you dragged it to 11am.</p>
 <hr>
 <h2 id="a-picture-of-the-system">A picture of the system</h2>
 <p>I start with something I could draw in a few minutes. Writes stay on the home shard. Anything that crosses users is async or scatter-gather. No distributed transaction.</p>
 <p><a href="/calendar-design.png?v=3000"><img src="/calendar-design.png?v=3000" alt="High-level design of a Google Calendar–like system: clients, API, expander, sharded Postgres, and async fan-out"></a></p>
-<p>I would start on <strong>Postgres</strong>. A wide-column store is a later conversation, if someone is actually pushing scale.</p>
+<p>I would start on <strong>Postgres</strong>. A wide-column store (Cassandra, Bigtable — a different database shape for huge keyed writes, weaker transactions) is a later conversation, if someone is actually pushing scale.</p>
 <hr>
 <h2 id="a-tour-of-every-box">A tour of every box</h2>
 <p>This is the part I wish someone had written for me. Same order as the sketch.</p>
@@ -172,7 +179,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <p>TLS terminates at the edge. A CDN caches JS and images, not events. A load balancer takes one public URL and spreads 10,000 phones across many API machines. None of this is the interesting part; it’s the front door.</p>
 <h3 id="api-gateway-authn-authz">API gateway, AuthN, AuthZ</h3>
 <p>The gateway is the API front door: logged in? too many requests? which <code>calendar_id</code>?</p>
-<p><strong>AuthN</strong> is <em>who are you?</em> (this JWT is Alice).<br>
+<p><strong>AuthN</strong> is <em>who are you?</em> (this login token is Alice).<br>
 <strong>AuthZ</strong> is <em>are you allowed?</em> (Alice can read Bob’s calendar but not edit it). That’s the ACL, not the login.</p>
 <h3 id="calendar-api-stateless">Calendar API (stateless)</h3>
 <p>The program that implements range query, writes, RSVP, find-a-time. Stateless means any box can handle any request. Alice’s March view does not live in one machine’s RAM. Events live in Postgres. I can add API boxes when traffic grows.</p>
@@ -215,13 +222,13 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <table><thead><tr><th>scope</th><th>English</th><th>What I store</th></tr></thead><tbody><tr><td>this</td><td>only this Tuesday</td><td>one exception row</td></tr><tr><td>all</td><td>every Tuesday</td><td>patch the series</td></tr><tr><td>thisAndFollowing</td><td>this Tuesday onward</td><td>split into two series</td></tr></tbody></table>
 <p>RSVP is yes / no / maybe on <em>my</em> copy. I cannot change the title from Bob’s phone. I write status on Bob’s shard and notify the organizer.</p>
 <p><strong>freeBusy</strong> returns busy intervals. <strong>findTime</strong> asks: Alice, Bob, Cara need 30 minutes this week — which gaps work? I fetch each busy list, intersect free slots with working hours in each person’s timezone, sweep endpoints, return top K.</p>
-<p><strong>Scatter-gather</strong> means Bob’s calendar may be on another Postgres. I fire N small freeBusy calls (or read a busy cache), then merge in memory. I do not <code>JOIN</code> across machines, and I do not 2PC-lock three calendars to suggest a slot.</p>
+<p><strong>Scatter-gather</strong> means Bob’s calendar may be on another Postgres. I fire N small freeBusy calls (or read a busy cache), then merge in memory. I do not <code>JOIN</code> across machines, and I do not 2PC-lock three calendars to suggest a slot. (2PC is two-phase commit: try to make two databases commit as one. I refuse it later.)</p>
 <h3 id="shards-and-the-home-shard">Shards and the home shard</h3>
 <p>Postgres is the system of record. One instance cannot hold every calendar at this scale — CPU, disk I/O, vacuum, connections.</p>
 <p>A <strong>shard</strong> is one slice of the data on its own Postgres. I split by <code>calendar_id</code>. All of Alice’s work calendar — events, exceptions, ACL, her reminders — lives on one machine. That machine is the <strong>home shard</strong> for that calendar.</p>
 <p>Create / edit / delete is then one database transaction: all succeed or all fail. I never need a transaction across two buildings just to move my Tuesday.</p>
 <p>Alice’s calendar → shard A. Bob’s → shard B. A meeting Alice organizes is <em>born</em> on A. A copy is later written to B.</p>
-<p>Sharding by <code>event_id</code> would make “show March” hit every machine. Starting unsharded is fine. I’d shard when IOPS or vacuum start to hurt.</p>
+<p>Sharding by <code>event_id</code> would make “show March” hit every machine. Starting unsharded is fine. I’d shard when IOPS (disk operations per second) or vacuum start to hurt.</p>
 <h3 id="logical-shards-vs-physical-machines">Logical shards vs physical machines</h3>
 <p>A <strong>logical shard</strong> is a bucket — often a Postgres schema like <code>schema017.event_series</code>. You might have hundreds of them.</p>
 <p>A <strong>physical machine</strong> is the actual box. Five logical shards can sit on one host.</p>
@@ -308,7 +315,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <p>Instead: COMMIT on the home shard. The meeting exists. Fan-out eventually updates copies. Retry if B is down. Alice’s calendar is already correct.</p>
 <p>Cross-shard is async. No 2PC.</p>
 <h3 id="cdc-debezium-wal">CDC, Debezium, WAL</h3>
-<p>The WAL is Postgres’s diary of every change. CDC (often Debezium) tails that diary into Kafka so search, busy-bitmaps, and a data lake see <em>all</em> writes — including ones a script made — not only the ones the API remembered to publish.</p>
+<p>The WAL (write-ahead log) is Postgres’s diary of every change. CDC (change data capture, often via Debezium) tails that diary into Kafka so search, busy-bitmaps, and a data lake see <em>all</em> writes — including ones a script made — not only the ones the API remembered to publish.</p>
 <p>Outbox-only is enough for invite fan-out. CDC is how I’d keep search honest.</p>
 <h3 id="busy-bitmap">Busy-bitmap</h3>
 <p>A projection, not the source of truth. For each person, something like 14 days × 15-minute slots: 0 free, 1 busy.</p>
@@ -364,7 +371,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <h2 id="three-paths-through-the-system">Three paths through the system</h2>
 <p><strong>Alice opens March</strong></p>
 <ol>
-<li>Phone → load balancer → gateway checks JWT.</li>
+<li>Phone → load balancer → gateway checks the login token.</li>
 <li>ACL: she’s the owner.</li>
 <li>Shard map: <code>alice-work</code> → shard A.</li>
 <li>PgBouncer hands a reused connection to A.</li>
@@ -417,7 +424,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 <h3 id="copies-vs-pointers">Copies vs pointers</h3>
 <p>I already picked copies for a Google-like product and pointers for a page-embedded calendar. Organizer is source of truth for shared fields. Last write wins with a version. Not a CRDT.</p>
 <h3 id="find-a-time">Find-a-time</h3>
-<p>Same expand as the month view, clip to the window, merge overlaps. Cache <code>freebusy:{calendar_id}:{day}</code> with a short TTL and delete it on write.</p>
+<p>Same expand as the month view, clip to the window, merge overlaps. Cache <code>freebusy:{calendar_id}:{day}</code> with a short TTL (time-to-live, then the cache expires) and delete it on write.</p>
 <p>Company-wide room finding is a different product. Recurrence in find-a-time still expands only the search window.</p>
 <hr>
 <h2 id="where-id-use-redis-and-where-i-wouldnt">Where I’d use Redis (and where I wouldn’t)</h2>
@@ -460,7 +467,7 @@ If someone moves the 3pm while I have the week open, I’d push “this calendar
 
 <table><thead><tr><th>I’d put in Redis</th><th>Shape</th><th>If Redis dies</th></tr></thead><tbody><tr><td>Free/busy for a day</td><td><code>fb:{calendar_id}:{date}</code></td><td>Expand from Postgres</td></tr><tr><td>Busy bitmap for find-a-time</td><td>bits for ~14 days × 15 minutes</td><td>Rebuild from CDC, or scatter freeBusy</td></tr><tr><td>Optional expanded month</td><td><code>month:{calendar_id}:{yyyy-mm}</code></td><td>Run the expander</td></tr><tr><td>Pub/sub for “calendar changed”</td><td>channel <code>cal:{id}</code></td><td>Clients poll</td></tr><tr><td>Gateway rate limits</td><td><code>rl:{user_id}</code></td><td>Fail open or limit locally</td></tr></tbody></table>
 <p>After COMMIT I delete that calendar’s <code>fb:*</code> and <code>month:*</code> (and publish). A 30–120s TTL is a backstop.</p>
-<p>I would <strong>not</strong> store RRULEs in Redis, lock a booking with a Redis lock (that’s what <code>version</code> in Postgres is for), use a Redis list as an outbox, or make a giant ZSET the reminder system of record.</p>
+<p>I would <strong>not</strong> store RRULEs in Redis, lock a booking with a Redis lock (that’s what <code>version</code> in Postgres is for), use a Redis list as an outbox, or make a giant ZSET (sorted set) the reminder system of record.</p>
 <p>How I’d say it: <em>Redis holds answers I’ve already computed. Postgres holds the rules that make those answers true.</em></p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>Calendar API</span></span>
 <span class="line"><span>    |  miss</span></span>
