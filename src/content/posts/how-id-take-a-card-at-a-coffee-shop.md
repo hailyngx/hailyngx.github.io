@@ -218,10 +218,10 @@ I start with something I could draw in a few minutes. The *core* is synchronous:
                               Ledger (two rows, sum 0)
                               Redis optional, not SoT
 
-  10pm worker:  WHERE state='captured'
-                GROUP BY acquirer_id
-                one file per acquirer
-                settle only after ack
+  10pm worker:  WHERE state='captured' AND captured_at < cutoff
+                GROUP BY acquirer_id, shard
+                part files (~100k rows), cursor = payment_id
+                receipt ack ≠ result file
 ```
 
 Then the scale pass, given the number above. More than one API machine, so a load balancer. More than one Postgres, so a shard map. A second acquirer if the first is on fire. A queue only for settlement and back-office notifications — **after** the customer already has a receipt.
@@ -347,10 +347,10 @@ So the 10pm job is:
 
 1. Select `state = 'captured'` (that's why the index exists).
 2. **Group by `acquirer_id`.**
-3. Write one file per group. Name it with `acquirer_id + business_date + batch_id`.
-4. Mark those rows `settling` and stamp `batch_id`.
-5. Upload. Wait for ack, or pick up the ack in the morning.
-6. On ack, `settled`. On nack, keep them claimable and do not emit a duplicate file — same batch idempotency key.
+3. Cut into **part files** (~100k rows / ~50 MB), not one 40 GB blob. Name them `acquirer + date + shard + part_seq`.
+4. Mark those rows `settling` and stamp `batch_part_id` in the same transaction as the part row.
+5. Upload. Receipt-ack is "they got the file." Result-ack is a later file. Only then `settled`.
+6. On nack, keep them claimable and do not emit a duplicate part — same object key, same cursor.
 
 Recon, later:
 
@@ -362,6 +362,108 @@ Recon, later:
 Several reports. Not one. I would say that sentence even if the interviewer already knew it, because it is the requirement.
 
 A partially failed batch is the other trap. If I write 10,000 lines, flush 6,000, die, and rerun *without* a batch key, the acquirer sees 16,000 lines and I have invented money. The batch is a payment. It gets a key.
+
+That sketch is the *shape*. The rest of this section is the part most write-ups skip: what the bank actually accepts, how big the files get, and how you restart a worker without inventing money.
+
+### Authorize TPS is not a settlement API
+
+The [ShowOffer video](https://www.youtube.com/watch?v=ruxGKk51aHo) is a Stripe-shaped 10k-TPS board. It puts confirm on Kafka. I would not. Authorize is a phone call to a bank with a latency budget; a queue in the middle is how you miss tap-to-pay. Settlement is allowed to be slow. Those two facts are the whole split.
+
+They are also two different *provider APIs*:
+
+| Path | What it is | Shape | When |
+|---|---|---|---|
+| Authorize / capture | ISO 8583-style online message | request/response, milliseconds | every tap |
+| Settlement / clearing | a file (Visa BASE II, Mastercard IPM, or the acquirer's SFTP spec) | header + detail lines + trailer | once a day, per receiving bank |
+| Result / recon | a *different* file coming back | same, hours later | next window |
+
+Nobody is settling 10k rows per second against Chase SFTP. If the interviewer says "10k TPS," that number is the till. The nightly job is "how many captured rows accumulated while we were at 10k."
+
+A coffee-shop prompt may never reach 10k. If they keep the Stripe number anyway, I do the arithmetic on the board so they can see I am not hand-waving 40GB.
+
+### The 40GB file is a fake requirement
+
+10,000 taps/sec × 86,400 seconds = **864 million** captured rows in a full day, if that rate never sleeps. Ten acquirers, even split: **86.4 million rows each**, not 86,400. (86,400 is the seconds.) At 500 bytes a line that is ~43 GB *per acquirer*, ~432 GB across the system.
+
+I would not pack that into one file.
+
+Real clearing files have a header, detail records, and a trailer with counts and amount totals. Upload limits are hundreds of MB, not tens of GB. A 40GB PUT that dies at 97% is how you spend the night. Retry wants a small blast radius.
+
+So I cut on **record count** (or byte size), not on "one file per bank per day":
+
+100,000 rows × 500 B ≈ 50 MB. That is 864 part-files per acquirer per day at the even split. Ugly on a slide, boring in production.
+
+If the bank insists on one *logical* batch, the header still carries `batch_id` + `part 017 of 864`. They concatenate. I do not.
+
+Submit is not the result. I upload a part, they ack **receipt** (checksum, line count matches trailer) — that can be an SFTP drop or an HTTP 200. They **process** asynchronously. Hours later a result file shows up: accepted, rejected, amount mismatch, per line. Money in the merchant account is a third clock (ACH), and I would not pretend my `settled` flag is a wire transfer.
+
+### I would not CDC the cutoff
+
+CDC (a change feed off the primary: every insert/update becomes an event) is a good way to ping a merchant webhook. It is a bad way to decide "what is in Tuesday's Chase file."
+
+Cutoff is a **snapshot**. "Every `captured` row with `captured_at < 22:00 America/Los_Angeles`." A change feed has lag. Shards have different lags. A row that captured at 21:59:59 can show up in the feed at 22:00:20, or not, depending on the replica. You now have a distributed snapshot problem, which is how you double-settle or drop a latte.
+
+S3 is not a log you append line-by-line. You write an object. CDC-into-S3 means a worker buffering, rotating parts, and reconciling "did this line land" after a crash — all the failure cases of a file job, plus unordered events.
+
+After cutoff, Tuesday's captured set is frozen if I define it that way: new taps after 10pm belong to Wednesday. Refunds of Tuesday captures become reversal lines in Tuesday's file or a separate reversal file, not silent updates to a blob I already started.
+
+I would **read the database**. Shard by `merchant_id`. Run the job on **replicas** so the till keeps writing. `WHERE state = 'captured' AND captured_at >= day_start AND captured_at < cutoff AND batch_part_id IS NULL ORDER BY payment_id LIMIT 100000`.
+
+`ORDER BY payment_id` is the restart cursor. Same cutoff, same shard, same acquirer → same sequence of ids → same part bytes. The object key is deterministic: `s3://settle/{acquirer}/{date}/shard_{n}/part_{k}.csv`.
+
+### A part-file is a state machine, not a script
+
+```
+SettlementPart
+  part_id
+  acquirer_id
+  business_date
+  shard_id
+  part_seq                 -- 0, 1, 2, …
+  first_payment_id
+  last_payment_id
+  row_count
+  amount_cents             -- trailer
+  s3_uri
+  state                    -- writing | uploaded | submitted
+                           -- ack_receipt | result_applied | failed
+  idempotency_key
+```
+
+Worker loop, one shard, one acquirer:
+
+1. `SELECT … ORDER BY payment_id LIMIT 100000` from the replica. If empty, this pair is done.
+2. Write the CSV locally (or stream multipart to S3). Trailer = count + sum. Object key as above. If the worker dies here, S3 may have a partial multipart; abort it. Restart rebuilds the same key.
+3. **One primary transaction:** insert/upsert the `SettlementPart` row; `UPDATE payments SET state = 'settling', batch_part_id = $part WHERE payment_id IN (…) AND state = 'captured'`. The `AND state = 'captured'` is the lock against a double claim. If the transaction fails, payments are still `captured`, S3 object is overwritten next try. If it commits, those rows will not appear in the next `SELECT`.
+4. A **submitter** (separate from the writer) sends `state = 'uploaded'` parts to the acquirer. Crash after S3 but before send: submitter retries. The bank sees the same file id; they must treat re-upload as idempotent, or I only send after a local "submitted" that I never rewind without a human.
+5. Receipt ack → `ack_receipt`. I do **not** flip every payment to `settled` yet. I do not know they posted.
+
+A crashed writer does not "resume the left" by guessing. It looks at the last committed `last_payment_id` for that `(acquirer, date, shard)` and selects `payment_id > that`. Uncommitted work is still `captured` and will be picked again. That is the point of sorting.
+
+### Recon is a diff, not 864 million UPDATEs
+
+When the result file lands, I do not `UPDATE payments SET state = 'settled'` on 86 million rows in one statement. That is how you lock a shard for an hour and take the till down after all.
+
+Most lines match. I store **exceptions**, not applause.
+
+```
+SettlementException
+  part_id
+  payment_id          -- null if they have a line I don't
+  theirs_reference
+  kind                -- missing_theirs | extra_theirs | amount_mismatch
+  ours_cents
+  theirs_cents
+  state               -- open | retried | written_off
+```
+
+For a part whose trailer matches theirs (same count, same cents, no per-line rejects): mark the **part** `result_applied`. Payments in that part can move to `settled` in **chunks** — 1,000 to 10,000 ids at a time, `WHERE batch_part_id = $part AND payment_id > $cursor`, each chunk a small transaction on the **merchant shard that owns those ids**. Checkpoint `last_payment_id` on the part. Crash, continue. 86 million rows is 8,600 chunks of 10k, spread across shards, not one 864-million-row write. (The scary number is the *row count*, not "864 MB.")
+
+Partial failure in the result file: process in line-offset checkpoints. A poison line becomes an exception row; the rest of the part continues. Retry is "resubmit the missing ids as a new part with a new `part_seq`," never rewrite history in the old object.
+
+If they reject 12 lines, those 12 stay `settling` (or return to `captured` with a reason) and get a ticket. The other 99,988 settle. I would not hold the whole part hostage for twelve lattes.
+
+CDC still has a job: merchant webhooks, search, the data lake. Not Tuesday's Chase file.
 
 ---
 
@@ -422,7 +524,7 @@ Global: region-local authorize, because a San Francisco tap should not wait on E
 
 ## What I would refuse to say
 
-- "We'll find the captured rows and send them." Without an index, a group-by-acquirer, a batch key, and an ack, that sentence is fan fiction.
+- "We'll find the captured rows and send them." Without an index, a group-by-acquirer, part files, a cursor on `payment_id`, and an ack, that sentence is fan fiction.
 - "Eventual consistency is fine for payments." It is fine for the thank-you email.
 - "We don't store cards, so we can't recon per bank." We store `acquirer_id`.
 - "I'll put the tap on Kafka so it's scalable." I'll put the tap on Kafka so it's slow.
