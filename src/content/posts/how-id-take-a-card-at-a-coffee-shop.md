@@ -16,10 +16,10 @@ This note walks through that system in the order I'd teach it. We start with one
 
 ## 1. One latte, start to finish
 
-Oakland 12 rings up <span>$4.75</span>. Follow the money.
+Oakland 12 rings up 4.75 dollars. Follow the money.
 
-1. The customer taps. Our server asks the customer's bank: "set aside <span>$4.75</span>." The bank says yes. That is **authorize** — a hold. Nothing has moved yet. The card still has the money; it just can't spend those <span>$4.75</span> twice.
-2. The tip screen: +<span>$1.00</span>. We tell the bank: "actually take <span>$5.75</span>." That is **capture**. The register prints a receipt. The customer leaves.
+1. The customer taps. Our server asks the customer's bank: "set aside 4.75 dollars." The bank says yes. That is **authorize** — a hold. Nothing has moved yet. The card still has the money; it just can't spend those 4.75 dollars twice.
+2. The tip screen: plus 1.00. We tell the bank: "actually take 5.75 dollars." That is **capture**. The register prints a receipt. The customer leaves.
 3. At 10pm a job collects every captured row for the day, grouped by the **receiving bank** — the bank that pays the store. It writes small files and uploads them.
 4. The bank says "got the file." Hours later it sends a **result** file: this line posted, that line rejected. Money in the store's account is a third step, often the next day.
 
@@ -72,7 +72,7 @@ The first data-model mistake is one row with a status. It looks clean. Then the 
 
 So you keep two records.
 
-A **payment** is the business intent: "Oakland 12 wants <span>$5.75</span> from this tap." One row. It has a status: created, authorized, captured, settled, failed, refunded.
+A **payment** is the business intent: "Oakland 12 wants 5.75 dollars from this tap." One row. It has a status: created, authorized, captured, settled, failed, refunded.
 
 An **attempt** is one try to talk to the bank: this authorize, that capture, a refund, a settlement submit. One payment can have several attempts — the first authorize timed out, the second succeeded, later a refund.
 
@@ -188,7 +188,7 @@ Attempts have their own life: `initiated → success`, or `failed` then `retryin
 
 [![Sticky note: why not merge AUTH and capture? Hotels hold at check-in; ecommerce captures after ship](/images/auth-vs-capture.png)](/images/auth-vs-capture.png)
 
-If you merge authorize and capture, you have to guess the tip or run a second <span>$1</span> charge. Two calls is the product, not extra ceremony.
+If you merge authorize and capture, you have to guess the tip or run a second 1-dollar charge. Two calls is the product, not extra ceremony.
 
 ---
 
@@ -274,7 +274,7 @@ What breaks without extra machinery:
 
 [![A pay request times out with no idempotency key, so a retry may double-charge](/images/idempotency-timeout.png)](/images/idempotency-timeout.png)
 
-No key: reader posts <span>$50</span>, network drops, reader retries, you charge twice.
+No key: reader posts 50 dollars, network drops, reader retries, you charge twice.
 
 [![Retry with the same idempotency key hits a key store and returns the cached result](/images/idempotency-key.png)](/images/idempotency-key.png)
 
@@ -317,7 +317,7 @@ Schema adds: `payment.batch_part_id`, `attempt.idempotency_key`, the `Outbox` ta
 
 [![Double-entry ledger: debit customer -100 and credit merchant +100; a refund reverses both](/images/double-ledger.png)](/images/double-ledger.png)
 
-Every money event writes two lines that add to zero. Authorize <span>$4.75</span>:
+Every money event writes two lines that add to zero. Authorize 4.75 dollars:
 
 - debit `customer_hold` 475
 - credit `merchant_receivable` 475
