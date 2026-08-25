@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="The prompt says payment. The product is a till: hold, tip, capture, then settle with each receiving bank at 10pm. Not Stripe."><meta name="color-scheme" content="light dark"><title>How I&#39;d take a card at a coffee shop · haily.yevklnekqt.blog</title><script>
+<!DOCTYPE html><html lang="en"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="A coffee shop card reader: hold the funds, add a tip, then send the day to each receiving bank at 10pm."><meta name="color-scheme" content="light dark"><title>How I&#39;d take a card at a coffee shop · haily.yevklnekqt.blog</title><script>
       (function () {
         try {
           var stored = localStorage.getItem("theme");
@@ -15,13 +15,13 @@
       })();
     </script><link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/dreampulse/computer-modern-web-font@master/fonts.css"><link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.22/dist/katex.min.css"><link rel="stylesheet" href="/_astro/about.C8w7oBXg.css"></head> <body> <div class="wrap"> <header class="site-header"> <div class="wordmark-lockup">  <a class="wordmark" href="/">haily nguyen</a> </div> <div class="header-tools"> <nav class="nav" aria-label="Primary"> <a href="/">Notes</a> <a href="/about">About</a> </nav> <button class="theme-toggle" type="button" data-theme-toggle>
 🌙
-</button> </div> </header>  <article> <header class="article-header"> <h1>How I&#39;d take a card at a coffee shop</h1> <p class="post-meta">August 25, 2026</p> </header> <div class="prose"> <p>A lot of “design a payment system” write-ups are Stripe in a trench coat: wallets, marketplaces, 10k charges a second, a webhook bible. I have drawn that board. It is the wrong board if the product is a coffee shop.</p>
-<p>The product is a till. Someone taps a card for a latte. A tip might land thirty seconds later. At 10pm the store wants the captured rows bundled and sent to the banks that will actually pay the merchant. I do not get to skip to “we’ll reconcile with Visa.” Visa is a network. The money shows up per receiving bank, which means several files, not one.</p>
-<p>I’m writing this the same way I wrote the <a href="/posts/how-id-design-google-calendar">calendar note</a>: lock the product, name the API, put a state machine on the board, then walk the pictures. I sketched these as a cheat sheet. I’m going to split them and say what each one is <em>for</em>, in language I would actually use.</p>
-<p>I have not worked payments. That is not an excuse to stay vague. It is a reason to keep the nouns honest.</p>
+</button> </div> </header>  <article> <header class="article-header"> <h1>How I&#39;d take a card at a coffee shop</h1> <p class="post-meta">August 25, 2026</p> </header> <div class="prose"> <p>Most write-ups titled “design a payment system” are really about Stripe: wallets, marketplaces, thousands of charges a second, a lot of webhooks. I’ve drawn that. It doesn’t fit a coffee shop.</p>
+<p>Here, someone taps a card for a latte. They might add a tip thirty seconds later. At 10pm the store sends that day’s charges to the banks that actually pay them. That is not the same as “reconcile with Visa.” Visa moves the message. The money shows up at the receiving bank, so you get one file per bank, not one big Visa file.</p>
+<p>Same shape as the <a href="/posts/how-id-design-google-calendar">calendar note</a>: what we’re building, the API, the states a payment can be in, then the diagrams I sketched, one at a time.</p>
+<p>I haven’t worked in payments. I’m still going to say what each box does in ordinary words.</p>
 <hr>
 <h2 id="what-i-would-and-wouldnt-build">What I would and wouldn’t build</h2>
-<p>I’d start by reading the prompt twice. “Payment” is a title. The vertical is the design.</p>
+<p>I’d start by asking which payment system. A register is not Stripe.</p>
 <p>I’d include:</p>
 <ul>
 <li>Tap-to-pay at a counter: authorize fast, then capture</li>
@@ -35,7 +35,7 @@
 <p>I’d leave out, unless someone really wanted them: a consumer wallet, P2P, subscription billing, “design Stripe,” and a product-analytics pipeline. Those are other interviews.</p>
 <p>A few product questions hide most of the difficulty:</p>
 <p><strong>Hold then charge, or one shot?</strong><br>
-A coffee shop is two steps. The tap <em>holds</em> funds (<code>authorized</code>). Adding a tip, or ringing up a second pastry, <em>captures</em> a final amount that may not match the hold. If nobody captures before the hold expires, the authorization is released. Hotels do the same trick between check-in and check-out. Amazon does it between order and ship. Merging auth and capture because “it’s simpler” deletes those businesses.</p>
+A coffee shop is two steps. The tap <em>holds</em> funds (<code>authorized</code>) — the bank sets the money aside. Adding a tip, or a second pastry, <em>captures</em> a final amount that may not match the hold. If nobody captures before the hold expires, the bank releases it. Hotels do this between check-in and check-out. Amazon does it between order and ship. If you merge auth and capture into one call, you can’t change the amount, so you can’t do the tip.</p>
 <p><strong>Who is “the bank”?</strong><br>
 Three different companies will answer the phone.</p>
 <ul>
@@ -43,26 +43,31 @@ Three different companies will answer the phone.</p>
 <li>The <strong>network</strong> is Visa / Mastercard. They move the message.</li>
 <li>The <strong>acquirer</strong> (receiving bank) is who the <em>merchant</em> settled with. That is who produces the report I recon against at night.</li>
 </ul>
-<p>Not storing the raw card number does <strong>not</strong> mean I don’t know where the payment went. I chose an acquirer when I routed the auth. I persist <code>acquirer_id</code>. PCI is “don’t keep the PAN.” Settlement is “remember who you talked to.”</p>
+<p>Not storing the raw card number does <strong>not</strong> mean I don’t know where the payment went. When I sent the tap to a bank, I picked which bank. I save that as <code>acquirer_id</code>. PCI (the card-data rules) means: don’t keep the full card number. Settlement means: remember who you sent it to.</p>
 <p><strong>When does the money move?</strong><br>
 Authorize is a lock. Capture is “yes, take it.” Settle is “the acquirer filed it and the merchant will see it in the deposit.” The till must feel done at capture. Settlement can be a 10pm batch.</p>
 <p><strong>What is allowed to be slow?</strong><br>
-The tap is not. I would not put the authorization response on a queue and hope Kafka is having a good day. Settlement, webhooks to the merchant’s back office, recon: those can wait.</p>
-<p>Non-negotiables I’d write on the board:</p>
+The tap is not. I would not put the “approved” response on a message queue. If the queue is slow, the person is still standing at the counter. Settlement, emails to the store’s back office, reconciling with the bank: those can wait.</p>
+<p>I’d write these down:</p>
 <ul>
-<li>Money records are strongly consistent. Eventual consistency is for the receipt email, not the ledger.</li>
-<li>Retries must not double-charge. That is a unique key, not a vibe.</li>
-<li>A captured payment the nightly job cannot find is a bug in the index, not in “the batch.”</li>
-<li>One Visa file is the wrong recon target if the prompt said receiving banks.</li>
+<li>Money records need to be correct immediately. It’s fine if the receipt email is a few seconds late. It’s not fine if the ledger is.</li>
+<li>If the terminal retries, we must not charge twice. That’s a unique key in the database.</li>
+<li>If the 10pm job can’t find a captured payment, the table isn’t indexed for that query.</li>
+<li>If the prompt said receiving banks, one Visa file is the wrong target.</li>
 </ul>
 <hr>
 <h2 id="the-one-number">The one number</h2>
-<p>I wouldn’t invent cluster sizes. I’d name the bottleneck.</p>
-<p>A large chain: tens of thousands of stores, a few taps per minute per register at peak, a daily settlement that is tiny next to the taps. Writes are small and spiky (morning rush). The hot path is <strong>authorize in well under a second</strong>. The scary path is <strong>exactly-once capture</strong> when the terminal retries. The operational path is <strong>get every captured row into the right bank file at 10pm</strong>.</p>
-<p>I do not add a queue, a cache, or a second processor because a template said to. I add a box when it attacks one of those.</p>
+<p>I wouldn’t invent cluster sizes. I’d say what’s hard.</p>
+<p>A large chain: tens of thousands of stores, a few taps per minute per register at peak. The daily settlement file is small next to that. Mornings are spiky. Three things matter:</p>
+<ol>
+<li>The tap has to come back in well under a second (authorize).</li>
+<li>If the reader retries, we charge once, not twice (capture).</li>
+<li>At 10pm, every captured row has to land in the right bank’s file.</li>
+</ol>
+<p>I don’t add a queue or a cache because a template said to. I add a box when it helps one of those three.</p>
 <hr>
-<h2 id="the-api-that-is-the-product">The API that is the product</h2>
-<p>HTTP is fine. The till talks to me; I talk to an acquirer. The two calls I would actually defend:</p>
+<h2 id="the-api">The API</h2>
+<p>HTTP is fine. The card reader talks to me; I talk to a bank. The two calls that matter:</p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>POST /v1/holds</span></span>
 <span class="line"><span>POST /v1/holds/{hold_id}/capture</span></span></code></pre>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="json"><code><span class="line"><span style="color:#E1E4E8">POST /v</span><span style="color:#79B8FF">1</span><span style="color:#E1E4E8">/holds</span></span>
@@ -108,7 +113,7 @@ The tap is not. I would not put the authorization response on a queue and hope K
 <span class="line"><span>POST /v1/payments/{payment_id}/refunds   {amount, idempotency_key}</span></span>
 <span class="line"><span>GET  /v1/merchants/{id}/payments?state=&#x26;from=&#x26;to=</span></span>
 <span class="line"><span>POST /internal/settlement/run            {business_date, idempotency_key}</span></span></code></pre>
-<p>Refunds only from <code>captured</code> or <code>settled</code>. Database constraint, not an if-statement I will forget. Status reads are a primary-key lookup. I would not make the terminal poll Kafka to find out if the tap worked.</p>
+<p>Refunds only from <code>captured</code> or <code>settled</code>. I’d enforce that in the database, not only in application code. Looking up a payment is a simple id lookup. I would not make the card reader wait on a queue to find out if the tap worked.</p>
 <hr>
 <h2 id="the-data-model-a-payment-is-a-state-not-a-pile-of-flags">The data model: a payment is a state, not a pile of flags</h2>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>Payment</span></span>
@@ -158,7 +163,7 @@ The tap is not. I would not put the authorization response on a queue and hope K
 <span class="line"><span>INDEX payments (acquirer_id, state)</span></span>
 <span class="line"><span></span></span>
 <span class="line"><span>UNIQUE settlement_batches (acquirer_id, business_date, idempotency_key)</span></span></code></pre>
-<p><code>WHERE state = 'captured'</code> has to be an index lookup, not a table scan. In Postgres that is a btree on <code>state</code>. In DynamoDB that is a local secondary index on <code>state</code> with <code>captured_at</code> as the sort. I would say the words <em>local secondary index</em> out loud if we were on Dynamo, so nobody thinks I plan to scan the world at 10:01pm.</p>
+<p><code>WHERE state = 'captured'</code> has to use an index. Otherwise the 10pm job scans the whole table. In Postgres that’s a btree on <code>state</code>. In DynamoDB that’s a local secondary index on <code>state</code>, sorted by <code>captured_at</code>. I’d mention the index so it’s obvious we’re not reading every row at 10:01pm.</p>
 <p>A check constraint (or a real state-machine table) so you cannot jump <code>created → settled</code>, and you cannot refund <code>authorized</code>. The sticky on my board is the same idea: only valid transitions.</p>
 <hr>
 <h2 id="a-picture-of-the-till">A picture of the till</h2>
@@ -183,7 +188,7 @@ The tap is not. I would not put the authorization response on a queue and hope K
 <p>Then the scale pass, given the number above. More than one API machine, so a load balancer. More than one Postgres, so a shard map. A second acquirer if the first is on fire. A queue only for settlement and back-office notifications — <strong>after</strong> the customer already has a receipt.</p>
 <p>I would start on <strong>Postgres</strong>. I want one transaction for “move <code>authorized</code> → <code>captured</code> and append two ledger rows.” That is the rationale. Cassandra is a later conversation, and only if someone is actually pushing write volume I do not believe a coffee chain has.</p>
 <hr>
-<h2 id="the-tap-boxed">The tap, boxed</h2>
+<h2 id="the-tap">The tap</h2>
 <p>This is the first picture. Client, payment service, gateway, bank. The names in the sketch are web-flavored (Stripe). For a till, the “client” is the terminal, and the “gateway” is whichever acquirer I routed to. Same arrows.</p>
 <p><a href="/images/payment-flow.png"><img src="/images/payment-flow.png" alt="Payment processing flow: client pays, payment service auths through a gateway to a bank, and every step is recorded in a ledger"></a></p>
 <p>Left to right:</p>
@@ -193,10 +198,10 @@ The tap is not. I would not put the authorization response on a queue and hope K
 <li>The gateway <strong>charges</strong> the bank. In real life this is authorize, not “take the money.” The sketch’s word <code>charge</code> is doing too much work. I would label the arrow <code>auth</code> on a whiteboard and keep <code>capture</code> for later.</li>
 <li>Approve comes back. I confirm to the terminal. The barista sees a receipt. The customer is already putting the card away.</li>
 </ol>
-<p>The note under the ledger is the whole point of this box: <strong>every step is recorded. If any step fails, the payment should reflect exactly where it failed.</strong> A tap that times out is <code>authorized</code> or <code>failed</code> or <code>created</code> — a known state — not a missing row I will “figure out tomorrow.”</p>
-<p>What I would not do: wait for settlement before returning. Tap-to-pay has a latency budget. Settlement is tonight.</p>
+<p>The note under the ledger is the point: <strong>every step is recorded. If something fails, the payment should show exactly where it stopped.</strong> A tap that times out is still a row — <code>authorized</code>, <code>failed</code>, or <code>created</code> — not a missing row I’ll try to reconstruct tomorrow.</p>
+<p>I would not wait for settlement before returning. The person is at the counter. Settlement is tonight.</p>
 <hr>
-<h2 id="states-you-can-actually-point-at">States you can actually point at</h2>
+<h2 id="payment-states">Payment states</h2>
 <p><a href="/images/payment-state-machine.png"><img src="/images/payment-state-machine.png" alt="Payment state machine from created to authorized, captured, and settled, with failed and refunded as exits"></a></p>
 <p>Happy path, in order:</p>
 <p><code>created → authorized → captured → settled</code></p>
@@ -244,11 +249,11 @@ The tap is not. I would not put the authorization response on a queue and hope K
 <p>Because the final number is not known at tap time.</p>
 <p>A hotel holds at check-in and captures at checkout. An online shop authorizes at order and captures at ship. A coffee shop holds at tap and captures after the tip screen. Same gap, smaller dollar amounts, worse latency budget.</p>
 <p>If I merge them into one <code>charge</code>, I have to guess the tip, or I have to run a second charge for $1.00 and pray the idempotency story still holds. Two-step is the product.</p>
-<p>The leftover line on that sticky — you cannot refund a transaction that was never captured — is a state-machine rule, not a business slogan. Void the hold. Don’t pretend a refund.</p>
+<p>The leftover line on that sticky — you cannot refund a transaction that was never captured — is a rule about states. Cancel the hold. Don’t call it a refund.</p>
 <hr>
 <h2 id="double-charge-is-a-missing-unique-key">Double charge is a missing unique key</h2>
-<p>This is the picture people skip, and then they ship a till that charges twice when the Wi-Fi hiccups.</p>
-<p>Without a key: the terminal posts <code>$50</code>, the network drops on the way back, the terminal retries, I charge twice. The customer is still at the register. This is how you get a one-star review and a chargeback.</p>
+<p>If you skip this picture, a flaky Wi-Fi retry charges the customer twice.</p>
+<p>Without a key: the reader posts <code>$50</code>, the network drops on the way back, the reader retries, I charge twice. The customer is still at the register.</p>
 <p><a href="/images/idempotency-timeout.png"><img src="/images/idempotency-timeout.png" alt="A pay request times out with no idempotency key, so a retry may double-charge"></a></p>
 <p>With a key: the terminal sends <code>abc123</code>. I store <code>abc123 → payment_id</code> before I talk to the acquirer, or in the same database transaction that inserts the payment. Retry with <code>abc123</code> returns the same body. I do not call the acquirer again.</p>
 <p><a href="/images/idempotency-key.png"><img src="/images/idempotency-key.png" alt="Retry with the same idempotency key hits a key store and returns the cached result"></a></p>
@@ -266,14 +271,14 @@ The tap is not. I would not put the authorization response on a queue and hope K
 <li>credit <code>merchant_receivable</code> 475</li>
 </ul>
 <p>Capture with a <span class="katex"><span class="katex-mathml"><math xmlns="http://www.w3.org/1998/Math/MathML"><semantics><mrow><mn>1</mn><mi>t</mi><mi>i</mi><mi>p</mi><mo stretchy="false">(</mo><mi>n</mi><mi>o</mi><mi>w</mi></mrow><annotation encoding="application/x-tex">1 tip (now </annotation></semantics></math></span><span class="katex-html" aria-hidden="true"><span class="base"><span class="strut" style="height:1em;vertical-align:-0.25em;"></span><span class="mord">1</span><span class="mord mathnormal">t</span><span class="mord mathnormal">i</span><span class="mord mathnormal">p</span><span class="mopen">(</span><span class="mord mathnormal">n</span><span class="mord mathnormal">o</span><span class="mord mathnormal" style="margin-right:0.0269em;">w</span></span></span></span>5.75): extra pair for the 100, or a capture pair that replaces the hold — I’d pick one scheme and not mix them. Refund reverses the pair.</p>
-<p>Why I bother: if the two sides don’t sum to zero, the system is lying <em>right now</em>, not at month-end. Recon against a bank file becomes a diff of two lists instead of archaeology. Append-only means I don’t update a balance in place and lose the plot.</p>
-<p>I would not “eventual-consist” this. The payment row and the two ledger rows commit together.</p>
+<p>Why I bother: if the two sides don’t sum to zero, something is already wrong — you don’t wait until month-end to find out. Matching a bank file is then comparing two lists. I only append rows; I don’t edit a running balance in place.</p>
+<p>The payment row and the two ledger rows should commit in the same database transaction.</p>
 <hr>
 <h2 id="nightly-recon-is-per-receiving-bank">Nightly recon is per receiving bank</h2>
-<p>This is the picture that is easy to draw wrong.</p>
+<p>Easy to draw this one wrong.</p>
 <p><a href="/images/reconciliation.png"><img src="/images/reconciliation.png" alt="Reconciliation engine compares an internal ledger to a bank file and flags a missing txn4"></a></p>
-<p>The sketch compares “internal ledger” to “the bank” and finds <code>txn4</code> missing on the bank side. That is the right <em>shape</em>. The mistake is thinking “the bank” is Visa.</p>
-<p>Visa/Mastercard will happily sell you network reports. A coffee-shop prompt that says <strong>receiving banks</strong> wants the <strong>acquirer settlement files</strong>: one per acquirer, different formats, different cut-off times, different ids. Chase acquiring is not Adyen is not “the Visa file.”</p>
+<p>The sketch compares our ledger to “the bank” and finds <code>txn4</code> missing on their side. That’s the right idea. The mistake is thinking “the bank” is Visa.</p>
+<p>Visa and Mastercard will sell you network reports. If the prompt says <strong>receiving banks</strong>, you want each <strong>acquirer’s</strong> settlement file: different formats, different cut-off times, different ids. Chase acquiring is not Adyen, and neither is “the Visa file.”</p>
 <p>So the 10pm job is:</p>
 <ol>
 <li>Select <code>state = 'captured'</code> (that’s why the index exists).</li>
@@ -290,11 +295,11 @@ The tap is not. I would not put the authorization response on a queue and hope K
 <li>Extra on their side: they charged something I don’t have — don’t “fix” it by inserting a quiet row; ticket it.</li>
 <li>Amount mismatch: same id, different cents — ticket.</li>
 </ul>
-<p>Several reports. Not one. I would say that sentence even if the interviewer already knew it, because it is the requirement.</p>
-<p>A partially failed batch is the other trap. If I write 10,000 lines, flush 6,000, die, and rerun <em>without</em> a batch key, the acquirer sees 16,000 lines and I have invented money. The batch is a payment. It gets a key.</p>
-<p>That sketch is the <em>shape</em>. The rest of this section is the part most write-ups skip: what the bank actually accepts, how big the files get, and how you restart a worker without inventing money.</p>
+<p>Several reports. Not one.</p>
+<p>If a job writes 10,000 lines, dies after 6,000, and reruns <em>without</em> a key, the bank sees 16,000 lines and you’ve charged extra. Treat the batch like a payment: it gets its own idempotency key.</p>
+<p>The sketch is only the idea. The rest is what the bank actually accepts, how big the files get, and how you restart a worker without sending money twice.</p>
 <h3 id="authorize-tps-is-not-a-settlement-api">Authorize TPS is not a settlement API</h3>
-<p>The <a href="https://www.youtube.com/watch?v=ruxGKk51aHo">ShowOffer video</a> is a Stripe-shaped 10k-TPS board. It puts confirm on Kafka. I would not. Authorize is a phone call to a bank with a latency budget; a queue in the middle is how you miss tap-to-pay. Settlement is allowed to be slow. Those two facts are the whole split.</p>
+<p>The <a href="https://www.youtube.com/watch?v=ruxGKk51aHo">ShowOffer video</a> is a Stripe-style 10k-TPS design. It puts the confirm step on Kafka. I wouldn’t. Authorize is a live call to a bank; the person is waiting. A queue in the middle makes that slower. Settlement can be slow. That’s the split.</p>
 <p>They are also two different <em>provider APIs</em>:</p>
 
 
@@ -326,24 +331,24 @@ The tap is not. I would not put the authorization response on a queue and hope K
 
 
 <table><thead><tr><th>Path</th><th>What it is</th><th>Shape</th><th>When</th></tr></thead><tbody><tr><td>Authorize / capture</td><td>ISO 8583-style online message</td><td>request/response, milliseconds</td><td>every tap</td></tr><tr><td>Settlement / clearing</td><td>a file (Visa BASE II, Mastercard IPM, or the acquirer’s SFTP spec)</td><td>header + detail lines + trailer</td><td>once a day, per receiving bank</td></tr><tr><td>Result / recon</td><td>a <em>different</em> file coming back</td><td>same, hours later</td><td>next window</td></tr></tbody></table>
-<p>Nobody is settling 10k rows per second against Chase SFTP. If the interviewer says “10k TPS,” that number is the till. The nightly job is “how many captured rows accumulated while we were at 10k.”</p>
-<p>A coffee-shop prompt may never reach 10k. If they keep the Stripe number anyway, I do the arithmetic on the board so they can see I am not hand-waving 40GB.</p>
+<p>Nobody is sending 10k settlement rows per second to Chase over SFTP. If someone says “10k TPS,” that’s the taps. The nightly job is: how many captured rows piled up during the day.</p>
+<p>A coffee shop may never hit 10k. If they still want that number, I’d do the file-size math so 40GB isn’t a surprise.</p>
 <h3 id="the-40gb-file-is-a-fake-requirement">The 40GB file is a fake requirement</h3>
 <p>10,000 taps/sec × 86,400 seconds = <strong>864 million</strong> captured rows in a full day, if that rate never sleeps. Ten acquirers, even split: <strong>86.4 million rows each</strong>, not 86,400. (86,400 is the seconds.) At 500 bytes a line that is ~43 GB <em>per acquirer</em>, ~432 GB across the system.</p>
 <p>I would not pack that into one file.</p>
-<p>Real clearing files have a header, detail records, and a trailer with counts and amount totals. Upload limits are hundreds of MB, not tens of GB. A 40GB PUT that dies at 97% is how you spend the night. Retry wants a small blast radius.</p>
-<p>So I cut on <strong>record count</strong> (or byte size), not on “one file per bank per day”:</p>
-<p>100,000 rows × 500 B ≈ 50 MB. That is 864 part-files per acquirer per day at the even split. Ugly on a slide, boring in production.</p>
-<p>If the bank insists on one <em>logical</em> batch, the header still carries <code>batch_id</code> + <code>part 017 of 864</code>. They concatenate. I do not.</p>
-<p>Submit is not the result. I upload a part, they ack <strong>receipt</strong> (checksum, line count matches trailer) — that can be an SFTP drop or an HTTP 200. They <strong>process</strong> asynchronously. Hours later a result file shows up: accepted, rejected, amount mismatch, per line. Money in the merchant account is a third clock (ACH), and I would not pretend my <code>settled</code> flag is a wire transfer.</p>
-<h3 id="i-would-not-cdc-the-cutoff">I would not CDC the cutoff</h3>
-<p>CDC (a change feed off the primary: every insert/update becomes an event) is a good way to ping a merchant webhook. It is a bad way to decide “what is in Tuesday’s Chase file.”</p>
-<p>Cutoff is a <strong>snapshot</strong>. “Every <code>captured</code> row with <code>captured_at &#x3C; 22:00 America/Los_Angeles</code>.” A change feed has lag. Shards have different lags. A row that captured at 21:59:59 can show up in the feed at 22:00:20, or not, depending on the replica. You now have a distributed snapshot problem, which is how you double-settle or drop a latte.</p>
-<p>S3 is not a log you append line-by-line. You write an object. CDC-into-S3 means a worker buffering, rotating parts, and reconciling “did this line land” after a crash — all the failure cases of a file job, plus unordered events.</p>
+<p>A real clearing file has a header, detail lines, and a trailer with counts and totals. Uploads are usually capped at hundreds of MB, not tens of GB. If a 40GB upload dies at 97%, you start over. Smaller files are easier to retry.</p>
+<p>So I split on <strong>how many rows</strong> (or how many bytes), not “one file per bank per day”:</p>
+<p>100,000 rows × 500 B ≈ 50 MB. That’s 864 part-files per acquirer per day if traffic is even. A lot of files, each small enough to retry.</p>
+<p>If the bank wants one <em>logical</em> batch, the header still says <code>batch_id</code> and <code>part 017 of 864</code>. They can stitch them. I don’t build a 40GB object.</p>
+<p>Sending a file is not the result. I upload a part; they ack <strong>receipt</strong> (checksum, line count matches the trailer) — SFTP or HTTP 200. They <strong>process</strong> later. Hours later a result file comes back: accepted, rejected, or amount mismatch, per line. Actual money in the store’s account is a third step (ACH, a bank transfer that takes a day or two). <code>settled</code> in my database is not the same as “the wire landed.”</p>
+<h3 id="i-wouldnt-use-a-change-feed-for-the-cutoff">I wouldn’t use a change feed for the cutoff</h3>
+<p>CDC (every database write becomes an event) is fine for pinging a webhook. It’s a bad way to decide “what goes in Tuesday’s Chase file.”</p>
+<p>Cutoff is a snapshot: every <code>captured</code> row with <code>captured_at</code> before 10pm Pacific. A change feed lags. Different shards lag differently. A row captured at 9:59:59 might show up at 10:00:20, or not. Then you either send it twice or drop it.</p>
+<p>S3 isn’t a log you append line by line. You write a whole object. Feeding CDC into S3 means buffering, rotating files, and asking “did this line land?” after a crash — all the hard parts of a file job, plus events arriving out of order.</p>
 <p>After cutoff, Tuesday’s captured set is frozen if I define it that way: new taps after 10pm belong to Wednesday. Refunds of Tuesday captures become reversal lines in Tuesday’s file or a separate reversal file, not silent updates to a blob I already started.</p>
 <p>I would <strong>read the database</strong>. Shard by <code>merchant_id</code>. Run the job on <strong>replicas</strong> so the till keeps writing. <code>WHERE state = 'captured' AND captured_at >= day_start AND captured_at &#x3C; cutoff AND batch_part_id IS NULL ORDER BY payment_id LIMIT 100000</code>.</p>
 <p><code>ORDER BY payment_id</code> is the restart cursor. Same cutoff, same shard, same acquirer → same sequence of ids → same part bytes. The object key is deterministic: <code>s3://settle/{acquirer}/{date}/shard_{n}/part_{k}.csv</code>.</p>
-<h3 id="a-part-file-is-a-state-machine-not-a-script">A part-file is a state machine, not a script</h3>
+<h3 id="each-part-file-has-a-status">Each part file has a status</h3>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>SettlementPart</span></span>
 <span class="line"><span>  part_id</span></span>
 <span class="line"><span>  acquirer_id</span></span>
@@ -368,8 +373,8 @@ The tap is not. I would not put the authorization response on a queue and hope K
 </ol>
 <p>A crashed writer does not “resume the left” by guessing. It looks at the last committed <code>last_payment_id</code> for that <code>(acquirer, date, shard)</code> and selects <code>payment_id > that</code>. Uncommitted work is still <code>captured</code> and will be picked again. That is the point of sorting.</p>
 <h3 id="recon-is-a-diff-not-864-million-updates">Recon is a diff, not 864 million UPDATEs</h3>
-<p>When the result file lands, I do not <code>UPDATE payments SET state = 'settled'</code> on 86 million rows in one statement. That is how you lock a shard for an hour and take the till down after all.</p>
-<p>Most lines match. I store <strong>exceptions</strong>, not applause.</p>
+<p>When the result file lands, I don’t <code>UPDATE</code> 86 million payments to <code>settled</code> in one statement. That locks the database and the registers stall.</p>
+<p>Most lines match. I store the <strong>mismatches</strong> only.</p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>SettlementException</span></span>
 <span class="line"><span>  part_id</span></span>
 <span class="line"><span>  payment_id          -- null if they have a line I don't</span></span>
@@ -380,21 +385,21 @@ The tap is not. I would not put the authorization response on a queue and hope K
 <span class="line"><span>  state               -- open | retried | written_off</span></span></code></pre>
 <p>For a part whose trailer matches theirs (same count, same cents, no per-line rejects): mark the <strong>part</strong> <code>result_applied</code>. Payments in that part can move to <code>settled</code> in <strong>chunks</strong> — 1,000 to 10,000 ids at a time, <code>WHERE batch_part_id = $part AND payment_id > $cursor</code>, each chunk a small transaction on the <strong>merchant shard that owns those ids</strong>. Checkpoint <code>last_payment_id</code> on the part. Crash, continue. 86 million rows is 8,600 chunks of 10k, spread across shards, not one 864-million-row write. (The scary number is the <em>row count</em>, not “864 MB.”)</p>
 <p>Partial failure in the result file: process in line-offset checkpoints. A poison line becomes an exception row; the rest of the part continues. Retry is “resubmit the missing ids as a new part with a new <code>part_seq</code>,” never rewrite history in the old object.</p>
-<p>If they reject 12 lines, those 12 stay <code>settling</code> (or return to <code>captured</code> with a reason) and get a ticket. The other 99,988 settle. I would not hold the whole part hostage for twelve lattes.</p>
-<p>CDC still has a job: merchant webhooks, search, the data lake. Not Tuesday’s Chase file.</p>
+<p>If they reject 12 lines, those 12 stay <code>settling</code> (or go back to <code>captured</code> with a reason) and someone looks at them. The other 99,988 can settle. I wouldn’t block the whole file for twelve drinks.</p>
+<p>CDC is still useful for webhooks, search, and analytics. Not for Tuesday’s Chase file.</p>
 <hr>
 <h2 id="the-card-number-never-visits-my-server">The card number never visits my server</h2>
 <p><a href="/images/pci-tokenization.png"><img src="/images/pci-tokenization.png" alt="PCI tokenization: card number goes browser to processor iframe to Stripe; the server only gets a token"></a></p>
 <p>The sketch is the <strong>web</strong> version: the browser posts the PAN into a processor iframe (Stripe Elements and friends). My server receives a token. Raw card number never lands in my process, which is how you collapse a mountain of PCI into a questionnaire.</p>
 <p>A coffee shop is not a browser. The till is a certified terminal. The PAN stays in the terminal / acquirer tunnel (PCI PTS, whatever the vendor already paid lawyers to stamp). I still persist only a token, last4, brand, and <strong><code>acquirer_id</code></strong>.</p>
-<p>That last column is how I can not store card numbers <em>and</em> still recon per bank. Those are not in conflict. The failed version of this argument is “PCI means I don’t know which bank.” PCI means I don’t keep the PAN. Routing is my table.</p>
+<p>That last column is how I can skip storing card numbers and still recon per bank. Those aren’t in conflict. “We don’t store cards, so we don’t know the bank” mixes up two things. PCI means don’t keep the full number. Routing is a column I wrote when I sent the tap.</p>
 <hr>
 <h2 id="webhooks-are-for-the-back-office-not-the-tap">Webhooks are for the back office, not the tap</h2>
 <p><a href="/images/webhook-delivery.png"><img src="/images/webhook-delivery.png" alt="Webhook pipeline: payments DB to CDC to Kafka to a delivery worker posting to the merchant, with backoff and a DLQ"></a></p>
 <p>Once a row is <code>captured</code>, the store’s inventory system, payroll, or “we made money” dashboard may want a ping. That path is allowed to be async:</p>
 <p>Payments DB → change feed → queue → worker HTTP POSTs the merchant → 200 means done.</p>
 <p>At-least-once, exponential backoff (a minute, five, thirty, two hours), then a dead-letter queue a human can see. Each delivery carries an idempotency key so <em>their</em> server can ignore my retries.</p>
-<p>I would not run the <strong>authorization response</strong> through this pipe. Under load, a queue adds wait. Tap-to-pay is a synchronous round trip: terminal → me → acquirer → me → terminal. The picture above is what happens <em>after</em> the customer already walked off with the latte.</p>
+<p>I would not send the <strong>authorization response</strong> through this pipe. A queue adds wait. Tap-to-pay is a straight round trip: reader → me → bank → me → reader. The picture above is what happens <em>after</em> the customer already left with the coffee.</p>
 <p>If the acquirer is down mid-tap: fail fast (circuit breaker), retry with backoff only for timeouts that look transient, and if I have a second acquirer, route there <strong>for a new hold</strong>, not as a silent double. Fallback is a product decision I would say out loud: “this tap may hit a backup bank.”</p>
 <hr>
 <h2 id="how-i-would-shard-if-someone-asks">How I would shard, if someone asks</h2>
@@ -414,14 +419,14 @@ The tap is not. I would not put the authorization response on a queue and hope K
 </ul>
 <p>Global: region-local authorize, because a San Francisco tap should not wait on Europe. Settlement pipelines stay in-region so the files match residency rules. PCI and GDPR are not a footnote; they are why the PAN never arrives.</p>
 <hr>
-<h2 id="what-i-would-refuse-to-say">What I would refuse to say</h2>
+<h2 id="things-i-wouldnt-skip">Things I wouldn’t skip</h2>
 <ul>
-<li>“We’ll find the captured rows and send them.” Without an index, a group-by-acquirer, part files, a cursor on <code>payment_id</code>, and an ack, that sentence is fan fiction.</li>
-<li>“Eventual consistency is fine for payments.” It is fine for the thank-you email.</li>
+<li>“We’ll find the captured rows and send them.” You still need an index, grouping by bank, small part files, a cursor on <code>payment_id</code>, and an ack.</li>
+<li>“It’s fine if payment records catch up later.” That’s fine for a thank-you email, not for the ledger.</li>
 <li>“We don’t store cards, so we can’t recon per bank.” We store <code>acquirer_id</code>.</li>
-<li>“I’ll put the tap on Kafka so it’s scalable.” I’ll put the tap on Kafka so it’s slow.</li>
+<li>“I’ll put the tap on Kafka so it scales.” I’ll put the tap on Kafka so the person waits.</li>
 </ul>
-<p>The whole design, said once: <strong>hold is sync and idempotent, capture is sync and idempotent, settle is a 10pm batch grouped by the bank that will pay us, recon is a ledger diff against those files, and the card number was never mine.</strong></p> </div> </article>  <footer class="site-footer"> <div class="term-art"> <p class="term-prompt">haily@yevklnekqt:~$ ./beaver</p> <img class="term-pixel" src="/images/beaver.png?v=solid" width="64" height="40" alt=""> </div> <p class="footer-copy">
+<p>Once through: <strong>hold is live and safe to retry, capture is live and safe to retry, settle is a 10pm batch grouped by the bank that pays us, recon is comparing our list to their file, and the card number never sat on my server.</strong></p> </div> </article>  <footer class="site-footer"> <div class="term-art"> <p class="term-prompt">haily@yevklnekqt:~$ ./beaver</p> <img class="term-pixel" src="/images/beaver.png?v=solid" width="64" height="40" alt=""> </div> <p class="footer-copy">
 © 2026 Haily Nguyen
 <span class="footer-links"> <a href="https://github.com/hailyngx" target="_blank" rel="noreferrer">GitHub</a> <a href="https://www.linkedin.com/in/haily-nguyen/" target="_blank" rel="noreferrer">LinkedIn</a> </span> </p> </footer> </div> <div class="portrait-view" data-portrait-view hidden> <img src="/images/haily.png" alt="Haily Nguyen"> </div> <script>
       (function () {
