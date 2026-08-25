@@ -265,15 +265,15 @@ Each run has a <code>batch_id</code> / part id. Payments already tagged are skip
 <p>A common sketch is: cron at midnight, find captured payments, send a batch, mark settled. That’s the right shape. It usually skips how big the file is, how you restart a worker, and that “the bank” is each acquirer.</p>
 <p><a href="/images/reconciliation.png"><img src="/images/reconciliation.png" alt="Reconciliation engine compares an internal ledger to a bank file and flags a missing txn4"></a></p>
 <p>Visa will sell you a network report. You still want <strong>Chase’s file, Adyen’s file, …</strong> — different formats, different cut-offs. The store settled with those banks, not with Visa as a pile of money.</p>
-<p><strong>Authorize is not settlement.</strong> The tap is a fast request/response. Settlement is a file: header, detail lines, trailer with counts and totals. They ack <strong>receipt</strong> (“we got it”). They <strong>process</strong> later. A <strong>result</strong> file comes back. Deposit is later still.</p>
+<p><strong>Authorize is not settlement.</strong> The tap is a fast request/response. Settlement is almost never a 10,000-request-per-second HTTP API. If it were, you would not pack the day into one upload. What the receiving bank actually gives you is a <strong>file drop</strong> (SFTP, S3, a batch window): header, detail lines, trailer with counts and totals. They ack <strong>receipt</strong> (“we got it”). That ack is not the result. They <strong>process</strong> later, on their clock. A <strong>result</strong> file comes back — that is the asynchronous answer. Deposit is later still.</p>
 <h3 id="dont-make-one-40gb-file">Don’t make one 40GB file</h3>
-<p>If the chain were running at 10,000 taps/sec all day: 10,000 × 86,400 seconds = <strong>864 million</strong> rows. Ten banks, even split: <strong>86.4 million</strong> each — not 86,400, that’s the seconds. At 500 bytes a line, ~43 GB per bank.</p>
-<p>Uploads are usually capped at hundreds of MB. A 40GB put that dies at 97% starts over. Split on row count: 100,000 rows ≈ 50 MB → hundreds of <strong>part files</strong> per bank per day. Header can still say <code>batch_id</code>, <code>part 17 of 864</code>.</p>
+<p>If the chain were running at 10,000 taps/sec all day: 10,000 × 86,400 seconds = <strong>864 million</strong> rows. Ten banks, even split: <strong>86.4 million</strong> each — not 86,400. 86,400 is the number of seconds in a day. At 500 bytes a line, ~43 GB per bank.</p>
+<p>Uploads are usually capped at hundreds of MB. A 40GB put that dies at 97% starts over. Split on row count: 100,000 rows ≈ 50 MB → hundreds of <strong>part files</strong> per bank per day. Header can still say <code>batch_id</code>, <code>part 17 of 864</code>. Same logical batch, many objects.</p>
 <p>Receipt ack ≠ result. Don’t flip every payment to <code>settled</code> just because SFTP succeeded.</p>
 <h3 id="dont-use-a-change-feed-for-the-cutoff">Don’t use a change feed for the cutoff</h3>
-<p>CDC — every database write becomes an event — is fine for webhooks. It’s a bad way to decide “Tuesday’s Chase file.” Cutoff is a snapshot: <code>captured_at</code> before 10pm. Feeds lag; shards lag differently. You double-send or drop a row.</p>
-<p>S3 isn’t a log you append line by line. You write a whole object.</p>
-<p>After 10pm, new taps belong to Wednesday. Read <strong>replicas</strong>, shard by <code>merchant_id</code>:</p>
+<p>CDC — every database write becomes an event — is fine for webhooks. It’s a bad way to decide “Tuesday’s Chase file.” Cutoff is a snapshot: <code>captured_at</code> before 10pm. After 10pm that set is frozen; a capture at 10:01 belongs to Wednesday. Feeds lag; shards lag differently. You double-send or drop a row.</p>
+<p>S3 isn’t a log you append line by line. You write a whole object. If you try to “stream CDC into S3,” you now own local part files, a worker that can die mid-part, and the nasty case <strong>object landed, database write did not</strong>. Then you have an orphan file and the next run doesn’t know those rows were already sent.</p>
+<p>Direct reads are simpler. Shard by <code>merchant_id</code>, read <strong>replicas</strong> so the 10pm scan does not sit on the tap’s primary. After cutoff the day’s captured rows do not move. Sort by <code>payment_id</code> and you always get the same order, so a restart rebuilds the same part.</p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>WHERE state = 'captured'</span></span>
 <span class="line"><span>  AND captured_at >= day_start AND captured_at &#x3C; cutoff</span></span>
 <span class="line"><span>  AND batch_part_id IS NULL</span></span>
@@ -290,15 +290,24 @@ Each run has a <code>batch_id</code> / part id. Payments already tagged are skip
 <p>Worker, one shard, one bank:</p>
 <ol>
 <li>Select the next 100k ids from the replica. Empty → done.</li>
-<li>Write the file (trailer = count + sum). Crash here: abort the partial upload, rebuild the same key.</li>
-<li><strong>One transaction on the primary:</strong> save the part row; <code>UPDATE payments SET state = 'settling', batch_part_id = $part WHERE id IN (…) AND state = 'captured'</code>. The <code>AND state = 'captured'</code> stops a double claim.</li>
-<li>A separate submitter uploads <code>uploaded</code> parts. Crash after S3, before send: submitter retries the same file id.</li>
+<li>Write the file locally (trailer = count + sum). Crash here: throw away the local file. Nothing is claimed yet.</li>
+<li>Upload to a <strong>deterministic</strong> object key. Crash after S3, before the database: retry the same key (overwrite is fine). You do not invent a second file for the same rows.</li>
+<li><strong>One transaction on the primary:</strong> save the part row (<code>s3_uri</code>, <code>first_payment_id</code>, <code>last_payment_id</code>); <code>UPDATE payments SET state = 'settling', batch_part_id = $part WHERE id IN (…) AND state = 'captured'</code>. The <code>AND state = 'captured'</code> stops a double claim. If this transaction fails, the object may already exist — next run uses the same key and claims again.</li>
+<li>A submitter sends <code>uploaded</code> parts to the bank. Crash after send, before we record their receipt: submitter retries the same file id. Their side must treat that file id as idempotent too.</li>
 <li>Receipt → <code>ack_receipt</code>. Not <code>settled</code> yet.</li>
 </ol>
 <p>Restart cursor: last committed <code>last_payment_id</code>, then <code>payment_id > that</code>. Uncommitted work is still <code>captured</code> and will be picked again. That’s why we sort.</p>
 <h3 id="recon-store-mismatches-dont-update-86-million-rows-at-once">Recon: store mismatches, don’t UPDATE 86 million rows at once</h3>
-<p>When the result file lands, most lines match. Keep an <strong>exception</strong> table for the rest (missing on their side, extra on theirs, amount differs). If the trailer matches, mark the <strong>part</strong> done, then move payments to <code>settled</code> in chunks of 1,000–10,000 ids on the store’s shard, with a cursor. Crash, continue.</p>
-<p>Twelve rejected lines: those twelve stay <code>settling</code> (or go back to <code>captured</code> with a reason). The other 99,988 can settle. Don’t block the whole file.</p>
+<p>When the result file lands, most lines match. You do <strong>not</strong> need a second copy of every payment. You need an <strong>exception</strong> table for the rest:</p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>SettlementException</span></span>
+<span class="line"><span>  acquirer_id, business_date, part_id</span></span>
+<span class="line"><span>  payment_id          -- null if they have a line we don't</span></span>
+<span class="line"><span>  provider_ref</span></span>
+<span class="line"><span>  kind                missing_theirs | extra_theirs | amount_mismatch | rejected</span></span>
+<span class="line"><span>  our_cents, their_cents</span></span>
+<span class="line"><span>  status              open | resolved</span></span></code></pre>
+<p>If the trailer matches, mark the <strong>part</strong> <code>result_applied</code>, then move the matching payments to <code>settled</code> in chunks of 1,000–10,000 ids on <strong>that store’s shard</strong>, with a cursor. Crash, continue. An 86-million-row <code>UPDATE</code> on one machine is a WAL and lock storm, not a shortcut.</p>
+<p>Twelve rejected lines: those twelve stay <code>settling</code> (or go back to <code>captured</code> with a reason) and get exception rows. The other 99,988 can settle. Don’t block the whole file.</p>
 <hr>
 <h2 id="11-webhooks">11. Webhooks</h2>
 <p>The till already knows the latte happened. The store’s other software — inventory, payroll, a tablet in the back — shouldn’t poll “is it captured yet?” every few seconds. We <strong>POST</strong> them when something important happens.</p>
