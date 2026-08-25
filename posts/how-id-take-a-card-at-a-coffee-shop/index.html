@@ -17,7 +17,7 @@
 🌙
 </button> </div> </header>  <article> <header class="article-header"> <h1>How I&#39;d take a card at a coffee shop</h1> <p class="post-meta">August 25, 2026</p> </header> <div class="prose"> <p>If you’ve seen a payment system drawn as a website checkout, it usually looks like this: the merchant creates a payment, the customer confirms later, a worker talks to the card network, and once a day you settle. That is a real product. It is not a coffee shop.</p>
 <p>At a register, someone taps a card for a latte. They might add a tip thirty seconds later. The approval has to come back while they are still at the counter. At 10pm the store sends that day’s charges to the banks that actually pay them — not one Visa file.</p>
-<p>This note walks through that system in the order I’d teach it. We start with one latte so the words mean something. Then we look at the records, the API, and the states. After that: why the tap stays live, how we keep the card number off our servers, how retries don’t double-charge, how the ledger works, how the 10pm files actually get built, and how we tell the rest of the store without blocking the receipt.</p>
+<p>This note walks through that system in the order I’d teach it. We start with one latte so the words mean something. Then we look at the records — they live in a relational database — the API, and the states. After that: why the tap stays live, how we keep the card number off our servers, how retries don’t double-charge, how the ledger works, how the 10pm files actually get built, and how we tell the rest of the store without blocking the receipt.</p>
 <hr>
 <h2 id="1-one-latte-start-to-finish">1. One latte, start to finish</h2>
 <p>Oakland 12 rings up $4.75. Follow the money.</p>
@@ -84,6 +84,15 @@ Not the tap. Settlement, emails to the back office, reconciling the result file:
 <span class="line"><span>  idempotency_key</span></span>
 <span class="line"><span>  processed_at</span></span></code></pre>
 <p>Never put card number, expiry, or CVC on <code>Payment</code>. We’ll come back to why.</p>
+<p>These rows live in a <strong>relational database</strong> (Postgres is the one I’d pick). That is not a default box on a template. Payments need:</p>
+<ul>
+<li><strong>One transaction, several writes.</strong> Move the payment to <code>captured</code> and write two ledger rows that sum to zero. If those can commit separately, the books already lie. A relational store gives you <code>BEGIN … COMMIT</code> across tables.</li>
+<li><strong>Keys the database enforces.</strong> Unique on <code>(merchant_id, idempotency_key)</code> so two machines cannot insert the same retry. Foreign key from <code>Attempt.payment_id</code> to <code>Payment</code>, so you cannot record a bank call for a payment that does not exist.</li>
+<li><strong>Legal states in the schema.</strong> A check constraint or an enum so <code>created → settled</code> is impossible even if the handler has a bug.</li>
+<li><strong>Reads that join.</strong> Support asks “show me this latte and every time we talked to the bank.” That is <code>Payment</code> plus its <code>Attempt</code> rows, not a scavenger hunt across logs.</li>
+</ul>
+<p>A document store or a wide-column store can hold JSON. They make the <em>next</em> sentence hard: “those four writes either all happened or none did.” Redis can cache the idempotency lookup. It is not the source of truth for money. If Redis restarts, the unique row in Postgres is still there.</p>
+<p>I would not start on a ledger in Kafka, or on a database that only offers eventual consistency for the tap. Eventual is for the receipt email.</p>
 <hr>
 <h2 id="4-the-api">4. The API</h2>
 <p>The card reader talks to us; we talk to a bank. Two calls do almost all of the product:</p>
@@ -190,11 +199,11 @@ Not the tap. Settlement, emails to the back office, reconciling the result file:
 <span class="line"><span>                                      |                    Acquirer B</span></span>
 <span class="line"><span>                                      |  record every step</span></span>
 <span class="line"><span>                                      v</span></span>
-<span class="line"><span>                                Postgres (keyed by store)</span></span>
+<span class="line"><span>                                Relational DB (Postgres, keyed by store)</span></span>
 <span class="line"><span>                                Ledger (two rows, sum 0)</span></span>
 <span class="line"><span></span></span>
 <span class="line"><span>  Later: 10pm files, webhooks to the store's back office</span></span></code></pre>
-<p>Postgres is enough. You want one database transaction for “move to <code>captured</code> and write two ledger rows.” If those can diverge, your books are already lying.</p>
+<p>A relational database is enough. You want one ACID transaction for “move to <code>captured</code> and write two ledger rows.” If those can diverge, your books are already lying. Postgres (or MySQL, same idea) is that box. I would not put the tap’s source of truth in a queue or a cache.</p>
 <hr>
 <h2 id="7-security">7. Security</h2>
 <p>Two ways a naive design blows up: the card number lands on your servers, or one internal box can impersonate another.</p>
@@ -350,7 +359,7 @@ Each run has a <code>batch_id</code> / part id. Payments already tagged are skip
 <p>Global: authorize near the store. Keep settlement files in-region (residency rules). Same reason the card number never arrives.</p>
 <hr>
 <h2 id="recap">Recap</h2>
-<p>Start from the counter. Hold is live and safe to retry. Capture is live and safe to retry. The card number never sat on our server. Settle is tonight, grouped by the bank that pays us. Recon is comparing two lists. Webhooks leave after the receipt is already printed.</p>
+<p>Start from the counter. The tap’s source of truth is a relational database: one transaction for the payment, the attempts, and two ledger rows. Hold is live and safe to retry. Capture is live and safe to retry. The card number never sat on our server. Settle is tonight, grouped by the bank that pays us. Recon is comparing two lists. Webhooks leave after the receipt is already printed.</p>
 <p>If a box doesn’t help one of those, it doesn’t belong on the till.</p> </div> </article>  <footer class="site-footer"> <div class="term-art"> <p class="term-prompt">haily@yevklnekqt:~$ ./beaver</p> <img class="term-pixel" src="/images/beaver.png?v=solid" width="64" height="40" alt=""> </div> <p class="footer-copy">
 © 2026 Haily Nguyen
 <span class="footer-links"> <a href="https://github.com/hailyngx" target="_blank" rel="noreferrer">GitHub</a> <a href="https://www.linkedin.com/in/haily-nguyen/" target="_blank" rel="noreferrer">LinkedIn</a> </span> </p> </footer> </div> <div class="portrait-view" data-portrait-view hidden> <img src="/images/haily.png" alt="Haily Nguyen"> </div> <script>
