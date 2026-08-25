@@ -14,6 +14,8 @@ This is my first low-budget PC. I have been very excited to have a server on top
 
 The obvious homelab move is pass the GPU into Linux and feel serious. This board has no iGPU. Passthrough means a headless daily driver. I like having a monitor. So the split is ugly and correct: Ollama runs on Windows, where the 5060 Ti already works. A tiny Ubuntu VM (Multipass, Hyper-V, 2 vCPUs, 2 GB) serves the page, compiles LaTeX, holds files. They talk over the host-only address. Ollama is not on `0.0.0.0`. The rest of the house does not need a raw model port.
 
+[![Desktop, phone, and the box: files and a JD in, Qwen on the GPU, Ubuntu VM, resume on the server](/images/homelab-sketch.jpeg)](/images/homelab-sketch.jpeg)
+
 I picked Qwen 2.5 7B because it fits. 3B was cheaper and dumber. 14B would have been a swap-file personality test. I already have ChatGPT. I do not have an API key I want to meter per JD, and I do not want the master resume in a prompt that leaves by default. Local 7B is worse at prose. It is better at "this file did not become someone else's training set today."
 
 The first version asked the model to rewrite the whole `.tex`. I got empty PDFs and a very confident preamble. A 7B is a wording engine, not a typesetter. Now I keep the Jake template, rewrite bullets in chunks, sort the tools in the role line by hand so it does not invent a new job, and fit one page by clipping — not by crushing `\vspace` until Education sits on top of Experience. If a rewrite drops too many of the original nouns, I throw it out. I'd rather a slightly generic bullet than "Waymo" appearing in a job that was not Waymo.
