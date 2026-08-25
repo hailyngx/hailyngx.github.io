@@ -14,6 +14,8 @@ This note walks through that system in the order I'd teach it. One game so the w
 
 Assume standard 1-vs-1. No tournaments, no bots, unless someone asked.
 
+[![Whiteboard for an online chess site: requirements, scale, tables, APIs, and a game shard that serializes, dedupes, and checks each move](/images/chess-design.png)](/images/chess-design.png)
+
 ---
 
 ## 1. One game, start to finish
