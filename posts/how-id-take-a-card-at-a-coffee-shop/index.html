@@ -18,7 +18,6 @@
 </button> </div> </header>  <article> <header class="article-header"> <h1>How I&#39;d take a card at a coffee shop</h1> <p class="post-meta">August 25, 2026</p> </header> <div class="prose"> <p>A lot of payment designs assume a website like Stripe: the merchant creates a payment, the customer confirms later, a worker talks to the card network, once a day you settle. That isn’t a coffee shop.</p>
 <p>Here, someone taps a card for a latte. They might add a tip thirty seconds later. At 10pm the store sends that day’s charges to the banks that actually pay them — not one Visa file. The tap has to come back while the person is still at the counter, so I would not put “approved” on a message queue.</p>
 <p>This is the design in the order I’d want to learn it: one latte, the records, the API, then security, exactly-once retries, webhooks, and the 10pm files — the last of those is where this product actually gets hard.</p>
-<p>I haven’t worked in payments. Ordinary words first, jargon in parentheses.</p>
 <hr>
 <h2 id="1-one-latte-start-to-finish">1. One latte, start to finish</h2>
 <p>Oakland 12 rings up $4.75.</p>
