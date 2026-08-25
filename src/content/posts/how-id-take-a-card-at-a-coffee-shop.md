@@ -10,7 +10,13 @@ There's a [50-minute walkthrough](https://www.youtube.com/watch?v=ruxGKk51aHo) o
 
 Here, someone taps a card for a latte. They might add a tip thirty seconds later. At 10pm the store sends that day's charges to the banks that actually pay them — not one Visa file. The tap has to come back while the person is still at the counter, so I would not put "approved" on a message queue the way that video does.
 
-This note is that skeleton, rewritten for a register, in the order I'd want to learn it: one latte, then the records, then the API, then the pictures, then the parts that actually break (double charge, the 10pm file, telling the store).
+This note is that skeleton, rewritten for a register. After the basic board, the video does three deep dives — they're here under those names:
+
+1. **Security** — the card number never hits our servers (and workers shouldn't impersonate each other)
+2. **Exactly once** — retries must not double-charge
+3. **Webhooks** — tell the store's other software without blocking the receipt
+
+The video's settlement step is one cron sentence. That's a fourth dive here, because a coffee-shop prompt lives or dies on the 10pm files.
 
 I haven't worked in payments. Ordinary words first, jargon in parentheses.
 
@@ -225,23 +231,52 @@ I'd use Postgres. I want one transaction for "move to `captured` and write two l
 
 ---
 
-## 7. Don't keep the card number
+## 7. Deep dive 1 — Security
+
+This is [the video](https://www.youtube.com/watch?v=ruxGKk51aHo) at ~25:00. Two risks in a naive design.
+
+### Risk 1: the card number touches us
 
 [![PCI tokenization: card number goes browser to processor iframe to Stripe; the server only gets a token](/images/pci-tokenization.png)](/images/pci-tokenization.png)
 
-If the full card number, expiry, or CVC hits your servers — API, logs, queue, database — you fall under **PCI DSS level 1**: heavy audits, encryption rules, a lot of cost. The video's first deep dive is this, and it's right.
+If the full card number, expiry, or CVC hits your API, logs, queue, or database, you fall under **PCI DSS level 1**: audits, key management, facility rules, a lot of cost. A misconfigured log that prints a PAN is a breach, not a bug.
 
-**Tokenization:** the number goes to a certified vault (a processor iframe on the web; a certified terminal in a shop). You get back `tok_…`. You store the token. You send the token when you authorize. A leak of your database is not a leak of card numbers.
+**Tokenization** (replace the number with a safe stand-in):
 
-On the web: browser → processor iframe → processor → **token** → your server. On a coffee shop: the PAN stays in the terminal / bank tunnel. Same idea. You still save last4, brand, and **`acquirer_id`**.
+1. Customer enters the card in a certified place — Stripe.js / hosted fields on the web, a certified terminal in a shop.
+2. That widget talks to a **vault** (the processor). Our backend is not on that path.
+3. Vault returns `pm_abc123` (a **token**).
+4. Browser or terminal sends *only the token* to us.
+5. We store the token. We send the token when we authorize.
 
-"We don't store cards, so we don't know the bank" mixes those up. PCI = don't keep the number. Routing = a column you wrote when you sent the tap.
+A leak of our database is not a leak of card numbers. Log the token, never the payload.
+
+On a coffee shop the PAN stays in the terminal / bank tunnel (same idea, different box). We still save last4, brand, and **`acquirer_id`**.
+
+"We don't store cards, so we don't know the bank" mixes those up. PCI = don't keep the number. Routing = a column we wrote when we sent the tap.
+
+**Schema:** drop any `card_number` / `cvc` field. Add `payment_method_token`. That's the change the video says interviewers watch for.
+
+### Risk 2: one compromised worker can pretend to be another
+
+The video's second security point: auth workers, the payment API, and the 10pm job talking with no identity checks. If one box is hacked, it can issue refunds or settle by impersonating a friend (**lateral movement**).
+
+Fix: **mutual TLS (mTLS)** — both sides of an internal call show a certificate, not just the server. Each service (payment API, authorize worker, batch job) has its own cert from an internal CA. The payment database only accepts writes from services that are allowed to write. A random box presenting "I'm the settler" gets refused.
+
+I wouldn't draw a full zero-trust mesh in the first five minutes. I would say: internal calls are authenticated, the batch job cannot hit `POST /refunds`, and we don't put raw cards on the wire *inside* our network either.
 
 ---
 
-## 8. Charge once, even when things retry
+## 8. Deep dive 2 — Exactly once
 
-This is the video's second deep dive. In payments, doing the happy path twice is the bug.
+This is the video at ~33:00. In payments, doing the happy path twice is the bug.
+
+What breaks without extra machinery:
+
+- A retry authorizes the same card twice
+- A worker charges the bank, then crashes before saving the row (customer held, we have no record)
+- The 10pm job is rerun and settles the same payment twice
+- Two workers update the same row and the states fight
 
 [![A pay request times out with no idempotency key, so a retry may double-charge](/images/idempotency-timeout.png)](/images/idempotency-timeout.png)
 
@@ -251,25 +286,36 @@ No key: reader posts $50, network drops, reader retries, you charge twice.
 
 With key `abc123`: you store `abc123 → payment_id` and the response. Same key comes back → return the saved body. Do not call the bank again.
 
-Four habits, in ordinary words (this is the video's list, fitted to a register):
+Four strategies from the video, in ordinary words:
 
 **1. Idempotency keys on every money call.**  
-Hold, capture, refund, and the 10pm batch. Unique in Postgres on `(merchant_id, idempotency_key)`. Redis can cache lookups; the unique row is what stops two machines racing. Stripe's `Idempotency-Key` header is this. Also send *your* key to the bank if they support it, so they dedupe too.
+Hold, capture, refund, and the 10pm batch. Unique in Postgres on `(merchant_id, idempotency_key)`. Redis can cache lookups; the unique row is what stops two machines racing. Stripe's `Idempotency-Key` header is this. Also send *our* key to the bank if they support it, so they dedupe too.
 
-**2. Don't lose the bank's answer.**  
-Dangerous sequence: bank says yes, then your process dies before you write `authorized`. The customer is held, you have no row.
+**2. Transactional outbox (don't split "save" and "call the world").**  
+The nightmare: bank said yes, process died, no local row.
 
-On the tap I still call the bank live, but I write `created` + the key **first**, then call, then write the result. If we die in the middle, a retry with the same key sees `created` and asks the bank again **with the same key** (or an "inquire" call). It does not open a second hold.
+The video's fix: in **one database transaction**, write the payment change *and* a row in an **outbox** table ("please authorize pay_01", or "please settle this batch"). Commit. A worker reads the outbox and does the external call. If the worker dies, the row is still there. That's **at-least-once** delivery; the idempotency key makes it safe.
 
-The video's **transactional outbox** (write "please authorize" into a table in the same commit as the payment, then a worker does the side effect) is the right pattern for things that *can* be async: webhooks, "build tonight's file." I wouldn't use it to hide the tap behind Kafka.
+```
+Outbox
+  event_id
+  type          authorize | settle | webhook
+  payload
+  status        pending | sent | failed
+  created_at
+```
 
-**3. Only legal state moves, in the database.**  
-`UPDATE … SET state = 'captured' WHERE state = 'authorized'`. If two workers try, one gets zero rows. A version column (optimistic locking) is the same idea. You cannot jump `created → settled`.
+**Where I disagree with the video:** they put the *tap* on Kafka / outbox so the HTTP request returns before the bank answers. At a register the person is waiting. I call the bank **in the request**. I still write `created` + the key *first*, then call, then write the result. If we die in the middle, a retry with the same key sees `created` and asks the bank again **with the same key** (or an inquire). It does not open a second hold.
 
-**4. A token on the nightly batch.**  
-Each run has a `batch_id` / part id. Rows already tagged are skipped on retry. Otherwise a crashed 10pm job settles the same latte twice.
+I *would* use the outbox for webhooks and for "build tonight's file" — work that can wait.
 
-Keep the response body next to the key so a retry doesn't rebuild slightly different JSON.
+**3. Legal state moves in the database.**  
+`UPDATE … SET state = 'captured' WHERE state = 'authorized'`. Two workers: one gets zero rows. A `version` column (optimistic locking) is the same idea. You cannot jump `created → settled`.
+
+**4. A batch token on the nightly run.**  
+Each run has a `batch_id` / part id. Payments already tagged are skipped. Otherwise a crashed 10pm job settles the same latte twice.
+
+Schema adds from this dive: `payment.batch_part_id`, `attempt.idempotency_key`, the `Outbox` table. Keep the response body next to the key so a retry doesn't rebuild slightly different JSON.
 
 ---
 
@@ -288,7 +334,7 @@ Payment row + two ledger rows: same database commit.
 
 ---
 
-## 10. 10pm: files per receiving bank
+## 10. Deep dive (ours) — 10pm files per receiving bank
 
 The video's settlement step is: cron at midnight, find authorized (or captured) payments, send a batch, mark settled. That's the right *shape*. It doesn't say how big the file is, how you restart a worker, or that "the bank" is each acquirer.
 
@@ -352,31 +398,42 @@ Twelve rejected lines: those twelve stay `settling` (or go back to `captured` wi
 
 ---
 
-## 11. Tell the store later (webhooks)
+## 11. Deep dive 3 — Webhooks
+
+This is the video at ~43:00. Merchants shouldn't poll "is it captured yet?" every few seconds. We **POST** them when something important happens.
 
 [![Webhook pipeline: payments DB to CDC to Kafka to a delivery worker posting to the merchant, with backoff and a DLQ](/images/webhook-delivery.png)](/images/webhook-delivery.png)
 
-The store's other software (inventory, payroll) may want a ping when a payment is captured. They should not poll every second. That's a **webhook**: we POST them.
+**Do not wait for their server before you print the receipt.** If inventory is down, the latte still happened.
 
-The video's third deep dive: do **not** wait for their server before you print the receipt. In the same database commit that sets `captured`, insert a `webhook_events` row. A dispatcher sends it later.
-
-Production habits from that section, kept:
-
-- Exponential backoff (a minute, five, thirty, two hours)
-- Status on each event: pending / delivered / failed
-- Dead-letter queue after too many tries
-- **HMAC** signature with a shared secret so they can tell it's really us
-- Idempotency key on the payload so *they* can ignore our retries
+How: in the **same database transaction** that sets `captured` (or `settled`), insert a `webhook_events` row. That's the durable trigger — the video's outbox idea again. A **dispatcher** (separate service) reads new rows, or a queue, and HTTP POSTs the store.
 
 ```
 WebhookEvent
-  event_id, merchant_id, type, payload
-  status, attempts, last_attempt_at
+  event_id
+  merchant_id
+  type              payment.authorized | payment.captured | payment.settled
+  payload           payment_id, amount, status, …
+  status            pending | delivered | failed
+  attempts
+  last_attempt_at
+  created_at
+
+MerchantWebhookConfig
+  merchant_id
+  url
+  signing_secret
 ```
 
-Plus a small config table: their URL and signing secret.
+What "production" means here, from that dive:
 
-If the bank is down *during the tap*: fail fast, retry only timeouts, optional backup acquirer as a **new** hold (new key), not a silent second charge.
+- Exponential backoff: 1 min → 5 min → 30 min → 2 hr, then a **dead-letter queue** a human can see
+- Track status, attempt count, last attempt
+- Sign the body with **HMAC** and the shared secret so they can tell it's us, not a spoof
+- Put an idempotency key in the payload so *they* can ignore our retries (we deliver at-least-once)
+- Dispatcher never sits on the tap path
+
+If the bank is down *during the tap*: fail fast, retry only timeouts, optional backup acquirer as a **new** hold (new key), not a silent second charge. That's the register, not the webhook.
 
 ---
 
@@ -398,7 +455,7 @@ Global: authorize near the store. Keep settlement files in-region (residency rul
 
 ## Recap
 
-From the [video](https://www.youtube.com/watch?v=ruxGKk51aHo): payment vs attempt, don't store cards, keys + legal state moves + a batch token, webhooks off the hot path.
+From the [video](https://www.youtube.com/watch?v=ruxGKk51aHo): payment vs attempt; deep dive 1 tokens + mTLS; deep dive 2 keys, outbox, state guards, batch token; deep dive 3 webhooks off the hot path.
 
 From the register: the tap is live, capture is a second call for the tip, 10pm is **small files per receiving bank**, recon is a result file and an exception list — not one Visa dump and not one 40GB upload.
 
