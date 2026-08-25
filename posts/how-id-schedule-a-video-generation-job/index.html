@@ -1,4 +1,4 @@
-<!DOCTYPE html><html lang="en"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="A Sora-like pipeline is a task queue on a GPU pool that can vanish. Leases, fencing tokens, checkpoints, and what you do when the box dies at minute nine."><meta name="color-scheme" content="light dark"><title>How I&#39;d schedule a video generation job · haily.yevklnekqt.blog</title><script>
+<!DOCTYPE html><html lang="en"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="Sora is a task queue on a GPU pool that can vanish. Leases, fencing tokens, checkpoints, and what you do when the box dies at minute nine."><meta name="color-scheme" content="light dark"><title>How I&#39;d design Sora · haily.yevklnekqt.blog</title><script>
       (function () {
         try {
           var stored = localStorage.getItem("theme");
@@ -15,7 +15,7 @@
       })();
     </script><link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/dreampulse/computer-modern-web-font@master/fonts.css"><link rel="stylesheet" href="/_astro/about.C8w7oBXg.css"></head> <body> <div class="wrap"> <header class="site-header"> <div class="wordmark-lockup">  <a class="wordmark" href="/">haily nguyen</a> </div> <div class="header-tools"> <nav class="nav" aria-label="Primary"> <a href="/">Notes</a> <a href="/about">About</a> </nav> <button class="theme-toggle" type="button" data-theme-toggle>
 🌙
-</button> </div> </header>  <article> <header class="article-header"> <h1>How I&#39;d schedule a video generation job</h1> <p class="post-meta">August 25, 2026</p> </header> <div class="prose"> <p>A text-to-video API looks like a prompt and an MP4. The product is: take the job, put it on a GPU, survive the GPU disappearing, and never run the same video twice.</p>
+</button> </div> </header>  <article> <header class="article-header"> <h1>How I&#39;d design Sora</h1> <p class="post-meta">August 25, 2026</p> </header> <div class="prose"> <p>Sora looks like a prompt and an MP4. The product is: take the job, put it on a GPU, survive the GPU disappearing, and never run the same video twice.</p>
 <p>Generation takes minutes. The public request cannot sit open until the file exists. The pool is not a web fleet — one worker, one video, and the machine may be a spot instance that dies with a two-minute warning or with none. Prompt safety, billing, and moderation sit upstream. This note is the scheduler, the worker, and every way that pair fails.</p>
 <p>This is the order I’d teach it. One job so the words mean something. Then the records — a job is not an attempt — the API, and why we persist before we say 202. After that: which queue, pull vs push, the lease and the fencing token, checkpoints, cancel, and what we do when there are no GPUs left. Last, the failure cases one by one. That last section is the design.</p>
 <hr>
