@@ -6,30 +6,32 @@ tags:
   - systems
 ---
 
-A lot of payment designs assume a website like Stripe: the merchant creates a payment, the customer confirms later, a worker talks to the card network, once a day you settle. That isn't a coffee shop.
+If you've seen a payment system drawn as a website checkout, it usually looks like this: the merchant creates a payment, the customer confirms later, a worker talks to the card network, and once a day you settle. That is a real product. It is not a coffee shop.
 
-Here, someone taps a card for a latte. They might add a tip thirty seconds later. At 10pm the store sends that day's charges to the banks that actually pay them — not one Visa file. The tap has to come back while the person is still at the counter, so I would not put "approved" on a message queue.
+At a register, someone taps a card for a latte. They might add a tip thirty seconds later. The approval has to come back while they are still at the counter. At 10pm the store sends that day's charges to the banks that actually pay them — not one Visa file.
 
-This is the design in the order I'd want to learn it: one latte, the records, the API, then security, exactly-once retries, webhooks, and the 10pm files — the last of those is where this product actually gets hard.
+This note walks through that system in the order I'd teach it. We start with one latte so the words mean something. Then we look at the records, the API, and the states. After that: why the tap stays live, how we keep the card number off our servers, how retries don't double-charge, how the ledger works, how the 10pm files actually get built, and how we tell the rest of the store without blocking the receipt.
 
 ---
 
 ## 1. One latte, start to finish
 
-Oakland 12 rings up $4.75.
+Oakland 12 rings up \$4.75. Follow the money.
 
-1. The customer taps. Our server asks the customer's bank: "set aside $4.75." The bank says yes. That's **authorize** (a hold). Nothing has moved yet.
-2. The tip screen: +$1.00. We tell the bank: "actually take $5.75." That's **capture**. The register prints a receipt. The customer leaves.
-3. At 10pm a job collects every captured row for the day, grouped by the **receiving bank** (the bank that pays the store). It writes small files and uploads them.
+1. The customer taps. Our server asks the customer's bank: "set aside \$4.75." The bank says yes. That is **authorize** — a hold. Nothing has moved yet. The card still has the money; it just can't spend those \$4.75 twice.
+2. The tip screen: +\$1.00. We tell the bank: "actually take \$5.75." That is **capture**. The register prints a receipt. The customer leaves.
+3. At 10pm a job collects every captured row for the day, grouped by the **receiving bank** — the bank that pays the store. It writes small files and uploads them.
 4. The bank says "got the file." Hours later it sends a **result** file: this line posted, that line rejected. Money in the store's account is a third step, often the next day.
 
-If you remember only the sequence: **hold → capture → file per bank → result later.**
+If you remember only the sequence: **hold → capture → file per bank → result later.** Capture is when the register is done with the customer. Settlement is tonight's paperwork. Deposit is later still. Mixing those three up is how you end up marking a payment "settled" because an upload succeeded.
 
 ---
 
 ## 2. What to build
 
-I'd include:
+Before we draw boxes, lock the product. Otherwise you accidentally design Stripe.
+
+We're building a till:
 
 - Tap at the counter: authorize fast, then capture
 - A tip or a cancel after the tap, so the final amount can differ from the hold
@@ -38,41 +40,41 @@ I'd include:
 - Refunds only after capture (or after settle)
 - A way to retry hold, capture, and the nightly job without charging twice
 
-I'd leave out unless someone asked: wallets, peer-to-peer, subscriptions, "design Stripe," product analytics.
+Wallets, peer-to-peer, subscriptions, and a full merchant dashboard can wait. They don't change the till.
 
-Four questions, answered up front:
+Four questions hide most of the rest of the design. Answer them before you add a queue.
 
 **Hold then capture, or one charge?**  
-Two steps. Hotels hold at check-in and capture at checkout. Amazon authorizes at order and captures at ship. A coffee shop holds at tap and captures after the tip. One `charge` call can't change the amount.
+Two steps. Hotels hold at check-in and capture at checkout. Amazon authorizes at order and captures at ship. A coffee shop holds at tap and captures after the tip. One `charge` call can't change the amount, so it can't do the tip screen.
 
 **Who is "the bank"?**  
-Three companies:
+Three companies, and people mash them together:
 
 - **Issuer** — the customer's bank (Chase, if they tapped a Chase card)
 - **Network** — Visa / Mastercard. They move the message
 - **Acquirer** (receiving bank) — who the *store* settled with. That's who sends the nightly report
 
-Not storing the card number does not mean you don't know where the payment went. When you sent the tap, you picked an acquirer. Save that as `acquirer_id`.
+Not storing the card number does not mean you don't know where the payment went. When you sent the tap, you picked an acquirer. Save that as `acquirer_id`. PCI is "don't keep the number." Routing is a column you wrote on the way out.
 
 **When does money actually move?**  
-Authorize = lock. Capture = "yes, take it" (the register can treat this as done). Settle = the acquirer filed it. Deposit = later.
+Authorize = lock. Capture = "yes, take it" — the register can treat this as done. Settle = the acquirer filed it. Deposit = later.
 
 **What can be slow?**  
 Not the tap. Settlement, emails to the back office, reconciling the result file: those can wait.
 
-Security, exactly-once processing, durability, and high request rates all matter. For a coffee chain, the numbers that actually bite are: authorize in well under a second, never double-charge on retry, and get every captured row into the right bank file at 10pm. I only add boxes that help those.
+Security, retries, durability, and high request rates all matter. For a coffee chain, the numbers that actually bite are: authorize in well under a second, never double-charge on retry, and get every captured row into the right bank file at 10pm. Only add a box if it helps one of those.
 
 ---
 
 ## 3. Two records: the intent, and each attempt
 
-This is the data-model split I'd start with.
+The first data-model mistake is one row with a status. It looks clean. Then the first authorize times out, you retry, and you can no longer tell "we asked Chase twice" from "we asked once." Disputes need that history.
 
-A **payment** is the business intent: "Oakland 12 wants $5.75 from this tap." One row. It has a status: created, authorized, captured, settled, failed, refunded.
+So you keep two records.
 
-A **transaction** (I'd call it an **attempt**) is one try to talk to the bank: this authorize, that capture, a refund, a settlement submit. One payment can have several attempts — the first authorize timed out, the second succeeded, later a refund.
+A **payment** is the business intent: "Oakland 12 wants \$5.75 from this tap." One row. It has a status: created, authorized, captured, settled, failed, refunded.
 
-If you only flip a status on the payment row, you lose the history. You can't tell "we asked Chase twice" from "we asked once." Retries and disputes need the attempts.
+An **attempt** is one try to talk to the bank: this authorize, that capture, a refund, a settlement submit. One payment can have several attempts — the first authorize timed out, the second succeeded, later a refund.
 
 ```
 Merchant     id, name, api_key, status
@@ -97,13 +99,13 @@ Attempt      one call to a bank
   processed_at
 ```
 
-Never put card number, expiry, or CVC on `Payment`. That's the next section.
+Never put card number, expiry, or CVC on `Payment`. We'll come back to why.
 
 ---
 
 ## 4. The API
 
-The card reader talks to us; we talk to a bank. Two calls that matter:
+The card reader talks to us; we talk to a bank. Two calls do almost all of the product:
 
 ```
 POST /v1/holds
@@ -146,11 +148,11 @@ POST /v1/holds/hold_01/capture
 }
 ```
 
-Amounts are integer cents. Same `idempotency_key` = same payment. A new key = a new charge, on purpose.
+Amounts are integer cents, so you never fight floating point. Same `idempotency_key` means the same payment — if the reader retries, you return the saved result. A new key is a new charge, on purpose.
 
-A website often splits "create payment" (intent, no money) and "confirm" (customer pays). At a register those collapse: the tap *is* the confirm. I'd still keep hold and capture as two calls because of the tip.
+A website often splits "create payment" (intent, no money) and "confirm" (customer pays). At a register those collapse: the tap *is* the confirm. You still keep hold and capture as two calls because of the tip.
 
-The rest:
+The rest of the surface is small:
 
 ```
 GET  /v1/payments/{payment_id}
@@ -159,13 +161,13 @@ GET  /v1/merchants/{id}/payments?state=&from=&to=
 POST /internal/settlement/run             {business_date, idempotency_key}
 ```
 
-`GET` returns the payment plus its attempts, so support can see the trail. Refunds only from `captured` or `settled` — enforced in the database.
+`GET` returns the payment plus its attempts, so support can see the trail. Refunds only from `captured` or `settled` — enforced in the database, not only in the handler.
 
 ---
 
 ## 5. States
 
-A state machine is just: a payment is in one named place, and only some moves are allowed. You should not be able to settle something that was never authorized. Put that in the database, not only in application code.
+Think of a payment as sitting in one named place, with only some moves allowed. You should not be able to settle something that was never authorized. Put that in the database, not only in application code. Application code gets retried. The `WHERE` clause does not.
 
 [![Payment state machine from created to authorized, captured, and settled, with failed and refunded as exits](/images/payment-state-machine.png)](/images/payment-state-machine.png)
 
@@ -180,13 +182,13 @@ Happy path: `created → authorized → captured → settled`.
 | Nobody captured in time | `expired` |
 | Bank said no | `failed` |
 
-Refunds from `captured` or `settled` only. A hold that wasn't captured is cancelled or expires — don't call that a refund.
+Refunds from `captured` or `settled` only. A hold that wasn't captured is cancelled or expires — don't call that a refund. The customer never lost the money; you just released the lock.
 
-Attempts have their own little life: `initiated → success`, or `failed` then `retrying` if the error looks temporary (timeout), or stay failed if it's permanent (stolen card). Don't retry a decline in a loop.
+Attempts have their own life: `initiated → success`, or `failed` then `retrying` if the error looks temporary (timeout), or stay failed if it's permanent (stolen card). Don't retry a decline in a loop. The issuer already said no.
 
 [![Sticky note: why not merge AUTH and capture? Hotels hold at check-in; ecommerce captures after ship](/images/auth-vs-capture.png)](/images/auth-vs-capture.png)
 
-If you merge authorize and capture, you have to guess the tip or run a second $1 charge. Two calls is the product.
+If you merge authorize and capture, you have to guess the tip or run a second \$1 charge. Two calls is the product, not extra ceremony.
 
 ---
 
@@ -197,11 +199,11 @@ If you merge authorize and capture, you have to guess the tip or run a second $1
 Left to right, for a register:
 
 1. The reader says pay → `POST /holds`.
-2. We write a payment row (`created` or `authorized` once the bank answers) and a ledger line. If the bank never comes back, the row still exists and says where it stopped.
-3. The gateway asks the bank to **authorize** (the sketch says "charge"; I'd label that arrow `auth`).
+2. We write a payment row (`created`, then `authorized` once the bank answers) and a ledger line. If the bank never comes back, the row still exists and says where it stopped.
+3. The gateway asks the bank to **authorize**. (The sketch says "charge"; label that arrow `auth`. We have not captured yet.)
 4. Approve comes back. Receipt prints. Customer puts the card away.
 
-Some designs put step 3 on a queue: the API returns, a worker calls the bank later. That decouples a slow bank from a website. At a counter it means the person waits on the queue. I call the bank **in the request**. Queues are for 10pm and for "tell the store's other software."
+Some designs put step 3 on a queue: the API returns, a worker calls the bank later. That decouples a slow bank from a website, where the customer is already on a "processing" screen. At a counter it means the person waits on your queue. Call the bank **in the request**. Queues are for 10pm and for "tell the store's other software."
 
 ```
   Card reader                   Our payment service           Banks
@@ -219,23 +221,23 @@ Some designs put step 3 on a queue: the API returns, a worker calls the bank lat
   Later: 10pm files, webhooks to the store's back office
 ```
 
-I'd use Postgres. I want one transaction for "move to `captured` and write two ledger rows."
+Postgres is enough. You want one database transaction for "move to `captured` and write two ledger rows." If those can diverge, your books are already lying.
 
 ---
 
 ## 7. Security
 
-Two risks in a naive design.
+Two ways a naive design blows up: the card number lands on your servers, or one internal box can impersonate another.
 
-### Risk 1: the card number touches us
+### The card number should never touch us
 
 [![PCI tokenization: card number goes browser to processor iframe to Stripe; the server only gets a token](/images/pci-tokenization.png)](/images/pci-tokenization.png)
 
 If the full card number, expiry, or CVC hits your API, logs, queue, or database, you fall under **PCI DSS level 1**: audits, key management, facility rules, a lot of cost. A misconfigured log that prints a PAN is a breach, not a bug.
 
-**Tokenization** (replace the number with a safe stand-in):
+**Tokenization** is the fix: replace the number with a stand-in that is useless to a thief.
 
-1. Customer enters the card in a certified place — Stripe.js / hosted fields on the web, a certified terminal in a shop.
+1. Customer enters the card in a certified place — hosted fields on the web, a certified terminal in a shop.
 2. That widget talks to a **vault** (the processor). Our backend is not on that path.
 3. Vault returns `pm_abc123` (a **token**).
 4. Browser or terminal sends *only the token* to us.
@@ -243,25 +245,25 @@ If the full card number, expiry, or CVC hits your API, logs, queue, or database,
 
 A leak of our database is not a leak of card numbers. Log the token, never the payload.
 
-On a coffee shop the PAN stays in the terminal / bank tunnel (same idea, different box). We still save last4, brand, and **`acquirer_id`**.
+On a coffee shop the PAN stays in the terminal / bank tunnel — same idea, different box. We still save last4, brand, and **`acquirer_id`**.
 
 "We don't store cards, so we don't know the bank" mixes those up. PCI = don't keep the number. Routing = a column we wrote when we sent the tap.
 
-**Schema:** drop any `card_number` / `cvc` field. Add `payment_method_token`.
+Schema: drop any `card_number` / `cvc` field. Add `payment_method_token`.
 
-### Risk 2: one compromised worker can pretend to be another
+### One compromised worker should not pretend to be another
 
-Second risk: auth workers, the payment API, and the 10pm job talking with no identity checks. If one box is hacked, it can issue refunds or settle by impersonating a friend (**lateral movement**).
+If auth workers, the payment API, and the 10pm job talk with no identity checks, one hacked box can issue refunds or settle by impersonating a friend. That's **lateral movement**.
 
-Fix: **mutual TLS (mTLS)** — both sides of an internal call show a certificate, not just the server. Each service (payment API, authorize worker, batch job) has its own cert from an internal CA. The payment database only accepts writes from services that are allowed to write. A random box presenting "I'm the settler" gets refused.
+**Mutual TLS (mTLS)** is both sides of an internal call showing a certificate, not just the server. Each service (payment API, authorize worker, batch job) has its own cert from an internal CA. The payment database only accepts writes from services that are allowed to write. A random box presenting "I'm the settler" gets refused.
 
-I wouldn't draw a full zero-trust mesh in the first five minutes. I would say: internal calls are authenticated, the batch job cannot hit `POST /refunds`, and we don't put raw cards on the wire *inside* our network either.
+You don't need to draw a full mesh on day one. You do need: internal calls are authenticated, the batch job cannot hit `POST /refunds`, and we don't put raw cards on the wire *inside* our network either.
 
 ---
 
 ## 8. Exactly once
 
-In payments, doing the happy path twice is the bug.
+In payments, doing the happy path twice is the bug. Networks drop. Readers retry. Workers crash after the bank said yes. The 10pm job gets rerun. If you only handle the clean path, you double-charge.
 
 What breaks without extra machinery:
 
@@ -272,21 +274,21 @@ What breaks without extra machinery:
 
 [![A pay request times out with no idempotency key, so a retry may double-charge](/images/idempotency-timeout.png)](/images/idempotency-timeout.png)
 
-No key: reader posts $50, network drops, reader retries, you charge twice.
+No key: reader posts \$50, network drops, reader retries, you charge twice.
 
 [![Retry with the same idempotency key hits a key store and returns the cached result](/images/idempotency-key.png)](/images/idempotency-key.png)
 
 With key `abc123`: you store `abc123 → payment_id` and the response. Same key comes back → return the saved body. Do not call the bank again.
 
-Four strategies:
+Four things, used together:
 
 **1. Idempotency keys on every money call.**  
-Hold, capture, refund, and the 10pm batch. Unique in Postgres on `(merchant_id, idempotency_key)`. Redis can cache lookups; the unique row is what stops two machines racing. Stripe's `Idempotency-Key` header is this. Also send *our* key to the bank if they support it, so they dedupe too.
+Hold, capture, refund, and the 10pm batch. Unique in Postgres on `(merchant_id, idempotency_key)`. Redis can cache lookups; the unique row is what stops two machines racing. Stripe's `Idempotency-Key` header is this idea. Also send *our* key to the bank if they support it, so they dedupe too.
 
-**2. Transactional outbox (don't split "save" and "call the world").**  
+**2. Transactional outbox — don't split "save" and "call the world".**  
 The nightmare: bank said yes, process died, no local row.
 
-The fix: in **one database transaction**, write the payment change *and* a row in an **outbox** table ("please authorize pay_01", or "please settle this batch"). Commit. A worker reads the outbox and does the external call. If the worker dies, the row is still there. That's **at-least-once** delivery; the idempotency key makes it safe.
+The pattern: in **one database transaction**, write the payment change *and* a row in an **outbox** table ("please authorize pay_01", or "please settle this batch"). Commit. A worker reads the outbox and does the external call. If the worker dies, the row is still there. That's **at-least-once** delivery; the idempotency key makes the extra delivery safe.
 
 ```
 Outbox
@@ -297,9 +299,9 @@ Outbox
   created_at
 ```
 
-I would not put the *tap* on a queue or outbox so the HTTP request returns before the bank answers. At a register the person is waiting. I call the bank **in the request**. I still write `created` + the key *first*, then call, then write the result. If we die in the middle, a retry with the same key sees `created` and asks the bank again **with the same key** (or an inquire). It does not open a second hold.
+Do not put the *tap* on a queue or outbox so the HTTP request returns before the bank answers. At a register the person is waiting. Call the bank **in the request**. Still write `created` + the key *first*, then call, then write the result. If we die in the middle, a retry with the same key sees `created` and asks the bank again **with the same key** (or an inquire). It does not open a second hold.
 
-I *would* use the outbox for webhooks and for "build tonight's file" — work that can wait.
+Do use the outbox for webhooks and for "build tonight's file" — work that can wait.
 
 **3. Legal state moves in the database.**  
 `UPDATE … SET state = 'captured' WHERE state = 'authorized'`. Two workers: one gets zero rows. A `version` column (optimistic locking) is the same idea. You cannot jump `created → settled`.
@@ -315,30 +317,30 @@ Schema adds: `payment.batch_part_id`, `attempt.idempotency_key`, the `Outbox` ta
 
 [![Double-entry ledger: debit customer -100 and credit merchant +100; a refund reverses both](/images/double-ledger.png)](/images/double-ledger.png)
 
-Every money event writes two lines that add to zero. Authorize $4.75:
+Every money event writes two lines that add to zero. Authorize \$4.75:
 
 - debit `customer_hold` 475
 - credit `merchant_receivable` 475
 
 A refund reverses the pair. If they don't sum to zero, something is already wrong — you don't wait until month-end. Matching a bank file is then comparing two lists. Append only; don't edit a running total in place.
 
-Payment row + two ledger rows: same database commit.
+Payment row + two ledger rows: same database commit. If the payment says captured and the ledger doesn't, you will spend the next morning arguing with a spreadsheet.
 
 ---
 
 ## 10. 10pm files per receiving bank
 
-A common settlement sketch is: cron at midnight, find captured payments, send a batch, mark settled. That's the right shape. It usually skips how big the file is, how you restart a worker, and that "the bank" is each acquirer.
+A common sketch is: cron at midnight, find captured payments, send a batch, mark settled. That's the right shape. It usually skips how big the file is, how you restart a worker, and that "the bank" is each acquirer.
 
 [![Reconciliation engine compares an internal ledger to a bank file and flags a missing txn4](/images/reconciliation.png)](/images/reconciliation.png)
 
-Visa will sell you a network report. If the prompt said receiving banks, you want **Chase's file, Adyen's file, …** — different formats, different cut-offs.
+Visa will sell you a network report. You still want **Chase's file, Adyen's file, …** — different formats, different cut-offs. The store settled with those banks, not with Visa as a pile of money.
 
 **Authorize is not settlement.** The tap is a fast request/response. Settlement is a file: header, detail lines, trailer with counts and totals. They ack **receipt** ("we got it"). They **process** later. A **result** file comes back. Deposit is later still.
 
 ### Don't make one 40GB file
 
-If the chain were running at 10,000 taps/sec all day: 10,000 × 86,400 seconds = **864 million** rows. Ten banks, even split: **86.4 million** each, not 86,400 (that's the seconds). At 500 bytes a line, ~43 GB per bank.
+If the chain were running at 10,000 taps/sec all day: 10,000 × 86,400 seconds = **864 million** rows. Ten banks, even split: **86.4 million** each — not 86,400, that's the seconds. At 500 bytes a line, ~43 GB per bank.
 
 Uploads are usually capped at hundreds of MB. A 40GB put that dies at 97% starts over. Split on row count: 100,000 rows ≈ 50 MB → hundreds of **part files** per bank per day. Header can still say `batch_id`, `part 17 of 864`.
 
@@ -346,7 +348,7 @@ Receipt ack ≠ result. Don't flip every payment to `settled` just because SFTP 
 
 ### Don't use a change feed for the cutoff
 
-CDC (every database write becomes an event) is fine for webhooks. It's a bad way to decide "Tuesday's Chase file." Cutoff is a snapshot: `captured_at` before 10pm. Feeds lag; shards lag differently. You double-send or drop a row.
+CDC — every database write becomes an event — is fine for webhooks. It's a bad way to decide "Tuesday's Chase file." Cutoff is a snapshot: `captured_at` before 10pm. Feeds lag; shards lag differently. You double-send or drop a row.
 
 S3 isn't a log you append line by line. You write a whole object.
 
@@ -392,13 +394,13 @@ Twelve rejected lines: those twelve stay `settling` (or go back to `captured` wi
 
 ## 11. Webhooks
 
-Stores shouldn't poll "is it captured yet?" every few seconds. We **POST** them when something important happens.
+The till already knows the latte happened. The store's other software — inventory, payroll, a tablet in the back — shouldn't poll "is it captured yet?" every few seconds. We **POST** them when something important happens.
 
 [![Webhook pipeline: payments DB to CDC to Kafka to a delivery worker posting to the merchant, with backoff and a DLQ](/images/webhook-delivery.png)](/images/webhook-delivery.png)
 
 **Do not wait for their server before you print the receipt.** If inventory is down, the latte still happened.
 
-How: in the **same database transaction** that sets `captured` (or `settled`), insert a `webhook_events` row. That's the durable trigger — the outbox idea again. A **dispatcher** (separate service) reads new rows, or a queue, and HTTP POSTs the store.
+How: in the **same database transaction** that sets `captured` (or `settled`), insert a `webhook_events` row. That's the durable trigger — the outbox idea again. A **dispatcher** (a separate service) reads new rows, or a queue, and HTTP POSTs the store.
 
 ```
 WebhookEvent
@@ -417,7 +419,7 @@ MerchantWebhookConfig
   signing_secret
 ```
 
-What "production" means here:
+To actually ship this:
 
 - Exponential backoff: 1 min → 5 min → 30 min → 2 hr, then a **dead-letter queue** a human can see
 - Track status, attempt count, last attempt
@@ -425,21 +427,21 @@ What "production" means here:
 - Put an idempotency key in the payload so *they* can ignore our retries (we deliver at-least-once)
 - Dispatcher never sits on the tap path
 
-If the bank is down *during the tap*: fail fast, retry only timeouts, optional backup acquirer as a **new** hold (new key), not a silent second charge. That's the register, not the webhook.
+If the bank is down *during the tap*: fail fast, retry only timeouts, optional backup acquirer as a **new** hold (new key), not a silent second charge. That's the register, not the webhook. Don't mix those two failure modes.
 
 ---
 
 ## 12. If this gets bigger
 
-**Shard key** (which id you split data on):
+**Shard key** is the id you split data on. Pick it for the queries you actually run.
 
-- `payment_id` — writes spread evenly; a store's day and a bank's 10pm file hit every machine. I'd skip this first.
+- `payment_id` — writes spread evenly; a store's day and a bank's 10pm file hit every machine. Skip this first.
 - `merchant_id` / `store_id` — Oakland 12 lives together. Default. Watch a huge franchise stuffed under one id.
 - `acquirer_id` — 10pm grouping is local, but one store that uses two banks spans machines. Only if settlement is the main workflow.
 
-I'd shard by store, run the 10pm job per shard, then stitch parts per bank if they want one logical batch.
+Shard by store, run the 10pm job per shard, then stitch parts per bank if they want one logical batch.
 
-Ten times the taps: more API machines, a connection pool in front of Postgres (PgBouncer — a waiting room so you don't open 10,000 database sockets), cache the idempotency lookup if it's hot (cache is a hint; the unique row is the lock). Authorize stays live. If the bank is rate-limiting, the reader says busy — don't lie with a queue.
+Ten times the taps: more API machines, a connection pool in front of Postgres (PgBouncer is a waiting room so you don't open 10,000 database sockets), cache the idempotency lookup if it's hot (cache is a hint; the unique row is the lock). Authorize stays live. If the bank is rate-limiting, the reader says busy — don't lie with a queue.
 
 Global: authorize near the store. Keep settlement files in-region (residency rules). Same reason the card number never arrives.
 
@@ -447,4 +449,6 @@ Global: authorize near the store. Keep settlement files in-region (residency rul
 
 ## Recap
 
-Hold is live and safe to retry. Capture is live and safe to retry. Settle is tonight, grouped by the bank that pays us. Recon is comparing two lists. The card number never sat on our server. Webhooks leave after the receipt is already printed.
+Start from the counter. Hold is live and safe to retry. Capture is live and safe to retry. The card number never sat on our server. Settle is tonight, grouped by the bank that pays us. Recon is comparing two lists. Webhooks leave after the receipt is already printed.
+
+If a box doesn't help one of those, it doesn't belong on the till.
