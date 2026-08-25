@@ -176,10 +176,10 @@ The tap is not. I would not put the authorization response on a queue and hope K
 <span class="line"><span>                              Ledger (two rows, sum 0)</span></span>
 <span class="line"><span>                              Redis optional, not SoT</span></span>
 <span class="line"><span></span></span>
-<span class="line"><span>  10pm worker:  WHERE state='captured'</span></span>
-<span class="line"><span>                GROUP BY acquirer_id</span></span>
-<span class="line"><span>                one file per acquirer</span></span>
-<span class="line"><span>                settle only after ack</span></span></code></pre>
+<span class="line"><span>  10pm worker:  WHERE state='captured' AND captured_at &#x3C; cutoff</span></span>
+<span class="line"><span>                GROUP BY acquirer_id, shard</span></span>
+<span class="line"><span>                part files (~100k rows), cursor = payment_id</span></span>
+<span class="line"><span>                receipt ack ≠ result file</span></span></code></pre>
 <p>Then the scale pass, given the number above. More than one API machine, so a load balancer. More than one Postgres, so a shard map. A second acquirer if the first is on fire. A queue only for settlement and back-office notifications — <strong>after</strong> the customer already has a receipt.</p>
 <p>I would start on <strong>Postgres</strong>. I want one transaction for “move <code>authorized</code> → <code>captured</code> and append two ledger rows.” That is the rationale. Cassandra is a later conversation, and only if someone is actually pushing write volume I do not believe a coffee chain has.</p>
 <hr>
@@ -278,10 +278,10 @@ The tap is not. I would not put the authorization response on a queue and hope K
 <ol>
 <li>Select <code>state = 'captured'</code> (that’s why the index exists).</li>
 <li><strong>Group by <code>acquirer_id</code>.</strong></li>
-<li>Write one file per group. Name it with <code>acquirer_id + business_date + batch_id</code>.</li>
-<li>Mark those rows <code>settling</code> and stamp <code>batch_id</code>.</li>
-<li>Upload. Wait for ack, or pick up the ack in the morning.</li>
-<li>On ack, <code>settled</code>. On nack, keep them claimable and do not emit a duplicate file — same batch idempotency key.</li>
+<li>Cut into <strong>part files</strong> (~100k rows / ~50 MB), not one 40 GB blob. Name them <code>acquirer + date + shard + part_seq</code>.</li>
+<li>Mark those rows <code>settling</code> and stamp <code>batch_part_id</code> in the same transaction as the part row.</li>
+<li>Upload. Receipt-ack is “they got the file.” Result-ack is a later file. Only then <code>settled</code>.</li>
+<li>On nack, keep them claimable and do not emit a duplicate part — same object key, same cursor.</li>
 </ol>
 <p>Recon, later:</p>
 <ul>
@@ -292,6 +292,96 @@ The tap is not. I would not put the authorization response on a queue and hope K
 </ul>
 <p>Several reports. Not one. I would say that sentence even if the interviewer already knew it, because it is the requirement.</p>
 <p>A partially failed batch is the other trap. If I write 10,000 lines, flush 6,000, die, and rerun <em>without</em> a batch key, the acquirer sees 16,000 lines and I have invented money. The batch is a payment. It gets a key.</p>
+<p>That sketch is the <em>shape</em>. The rest of this section is the part most write-ups skip: what the bank actually accepts, how big the files get, and how you restart a worker without inventing money.</p>
+<h3 id="authorize-tps-is-not-a-settlement-api">Authorize TPS is not a settlement API</h3>
+<p>The <a href="https://www.youtube.com/watch?v=ruxGKk51aHo">ShowOffer video</a> is a Stripe-shaped 10k-TPS board. It puts confirm on Kafka. I would not. Authorize is a phone call to a bank with a latency budget; a queue in the middle is how you miss tap-to-pay. Settlement is allowed to be slow. Those two facts are the whole split.</p>
+<p>They are also two different <em>provider APIs</em>:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Path</th><th>What it is</th><th>Shape</th><th>When</th></tr></thead><tbody><tr><td>Authorize / capture</td><td>ISO 8583-style online message</td><td>request/response, milliseconds</td><td>every tap</td></tr><tr><td>Settlement / clearing</td><td>a file (Visa BASE II, Mastercard IPM, or the acquirer’s SFTP spec)</td><td>header + detail lines + trailer</td><td>once a day, per receiving bank</td></tr><tr><td>Result / recon</td><td>a <em>different</em> file coming back</td><td>same, hours later</td><td>next window</td></tr></tbody></table>
+<p>Nobody is settling 10k rows per second against Chase SFTP. If the interviewer says “10k TPS,” that number is the till. The nightly job is “how many captured rows accumulated while we were at 10k.”</p>
+<p>A coffee-shop prompt may never reach 10k. If they keep the Stripe number anyway, I do the arithmetic on the board so they can see I am not hand-waving 40GB.</p>
+<h3 id="the-40gb-file-is-a-fake-requirement">The 40GB file is a fake requirement</h3>
+<p>10,000 taps/sec × 86,400 seconds = <strong>864 million</strong> captured rows in a full day, if that rate never sleeps. Ten acquirers, even split: <strong>86.4 million rows each</strong>, not 86,400. (86,400 is the seconds.) At 500 bytes a line that is ~43 GB <em>per acquirer</em>, ~432 GB across the system.</p>
+<p>I would not pack that into one file.</p>
+<p>Real clearing files have a header, detail records, and a trailer with counts and amount totals. Upload limits are hundreds of MB, not tens of GB. A 40GB PUT that dies at 97% is how you spend the night. Retry wants a small blast radius.</p>
+<p>So I cut on <strong>record count</strong> (or byte size), not on “one file per bank per day”:</p>
+<p>100,000 rows × 500 B ≈ 50 MB. That is 864 part-files per acquirer per day at the even split. Ugly on a slide, boring in production.</p>
+<p>If the bank insists on one <em>logical</em> batch, the header still carries <code>batch_id</code> + <code>part 017 of 864</code>. They concatenate. I do not.</p>
+<p>Submit is not the result. I upload a part, they ack <strong>receipt</strong> (checksum, line count matches trailer) — that can be an SFTP drop or an HTTP 200. They <strong>process</strong> asynchronously. Hours later a result file shows up: accepted, rejected, amount mismatch, per line. Money in the merchant account is a third clock (ACH), and I would not pretend my <code>settled</code> flag is a wire transfer.</p>
+<h3 id="i-would-not-cdc-the-cutoff">I would not CDC the cutoff</h3>
+<p>CDC (a change feed off the primary: every insert/update becomes an event) is a good way to ping a merchant webhook. It is a bad way to decide “what is in Tuesday’s Chase file.”</p>
+<p>Cutoff is a <strong>snapshot</strong>. “Every <code>captured</code> row with <code>captured_at &#x3C; 22:00 America/Los_Angeles</code>.” A change feed has lag. Shards have different lags. A row that captured at 21:59:59 can show up in the feed at 22:00:20, or not, depending on the replica. You now have a distributed snapshot problem, which is how you double-settle or drop a latte.</p>
+<p>S3 is not a log you append line-by-line. You write an object. CDC-into-S3 means a worker buffering, rotating parts, and reconciling “did this line land” after a crash — all the failure cases of a file job, plus unordered events.</p>
+<p>After cutoff, Tuesday’s captured set is frozen if I define it that way: new taps after 10pm belong to Wednesday. Refunds of Tuesday captures become reversal lines in Tuesday’s file or a separate reversal file, not silent updates to a blob I already started.</p>
+<p>I would <strong>read the database</strong>. Shard by <code>merchant_id</code>. Run the job on <strong>replicas</strong> so the till keeps writing. <code>WHERE state = 'captured' AND captured_at >= day_start AND captured_at &#x3C; cutoff AND batch_part_id IS NULL ORDER BY payment_id LIMIT 100000</code>.</p>
+<p><code>ORDER BY payment_id</code> is the restart cursor. Same cutoff, same shard, same acquirer → same sequence of ids → same part bytes. The object key is deterministic: <code>s3://settle/{acquirer}/{date}/shard_{n}/part_{k}.csv</code>.</p>
+<h3 id="a-part-file-is-a-state-machine-not-a-script">A part-file is a state machine, not a script</h3>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>SettlementPart</span></span>
+<span class="line"><span>  part_id</span></span>
+<span class="line"><span>  acquirer_id</span></span>
+<span class="line"><span>  business_date</span></span>
+<span class="line"><span>  shard_id</span></span>
+<span class="line"><span>  part_seq                 -- 0, 1, 2, …</span></span>
+<span class="line"><span>  first_payment_id</span></span>
+<span class="line"><span>  last_payment_id</span></span>
+<span class="line"><span>  row_count</span></span>
+<span class="line"><span>  amount_cents             -- trailer</span></span>
+<span class="line"><span>  s3_uri</span></span>
+<span class="line"><span>  state                    -- writing | uploaded | submitted</span></span>
+<span class="line"><span>                           -- ack_receipt | result_applied | failed</span></span>
+<span class="line"><span>  idempotency_key</span></span></code></pre>
+<p>Worker loop, one shard, one acquirer:</p>
+<ol>
+<li><code>SELECT … ORDER BY payment_id LIMIT 100000</code> from the replica. If empty, this pair is done.</li>
+<li>Write the CSV locally (or stream multipart to S3). Trailer = count + sum. Object key as above. If the worker dies here, S3 may have a partial multipart; abort it. Restart rebuilds the same key.</li>
+<li><strong>One primary transaction:</strong> insert/upsert the <code>SettlementPart</code> row; <code>UPDATE payments SET state = 'settling', batch_part_id = $part WHERE payment_id IN (…) AND state = 'captured'</code>. The <code>AND state = 'captured'</code> is the lock against a double claim. If the transaction fails, payments are still <code>captured</code>, S3 object is overwritten next try. If it commits, those rows will not appear in the next <code>SELECT</code>.</li>
+<li>A <strong>submitter</strong> (separate from the writer) sends <code>state = 'uploaded'</code> parts to the acquirer. Crash after S3 but before send: submitter retries. The bank sees the same file id; they must treat re-upload as idempotent, or I only send after a local “submitted” that I never rewind without a human.</li>
+<li>Receipt ack → <code>ack_receipt</code>. I do <strong>not</strong> flip every payment to <code>settled</code> yet. I do not know they posted.</li>
+</ol>
+<p>A crashed writer does not “resume the left” by guessing. It looks at the last committed <code>last_payment_id</code> for that <code>(acquirer, date, shard)</code> and selects <code>payment_id > that</code>. Uncommitted work is still <code>captured</code> and will be picked again. That is the point of sorting.</p>
+<h3 id="recon-is-a-diff-not-864-million-updates">Recon is a diff, not 864 million UPDATEs</h3>
+<p>When the result file lands, I do not <code>UPDATE payments SET state = 'settled'</code> on 86 million rows in one statement. That is how you lock a shard for an hour and take the till down after all.</p>
+<p>Most lines match. I store <strong>exceptions</strong>, not applause.</p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>SettlementException</span></span>
+<span class="line"><span>  part_id</span></span>
+<span class="line"><span>  payment_id          -- null if they have a line I don't</span></span>
+<span class="line"><span>  theirs_reference</span></span>
+<span class="line"><span>  kind                -- missing_theirs | extra_theirs | amount_mismatch</span></span>
+<span class="line"><span>  ours_cents</span></span>
+<span class="line"><span>  theirs_cents</span></span>
+<span class="line"><span>  state               -- open | retried | written_off</span></span></code></pre>
+<p>For a part whose trailer matches theirs (same count, same cents, no per-line rejects): mark the <strong>part</strong> <code>result_applied</code>. Payments in that part can move to <code>settled</code> in <strong>chunks</strong> — 1,000 to 10,000 ids at a time, <code>WHERE batch_part_id = $part AND payment_id > $cursor</code>, each chunk a small transaction on the <strong>merchant shard that owns those ids</strong>. Checkpoint <code>last_payment_id</code> on the part. Crash, continue. 86 million rows is 8,600 chunks of 10k, spread across shards, not one 864-million-row write. (The scary number is the <em>row count</em>, not “864 MB.”)</p>
+<p>Partial failure in the result file: process in line-offset checkpoints. A poison line becomes an exception row; the rest of the part continues. Retry is “resubmit the missing ids as a new part with a new <code>part_seq</code>,” never rewrite history in the old object.</p>
+<p>If they reject 12 lines, those 12 stay <code>settling</code> (or return to <code>captured</code> with a reason) and get a ticket. The other 99,988 settle. I would not hold the whole part hostage for twelve lattes.</p>
+<p>CDC still has a job: merchant webhooks, search, the data lake. Not Tuesday’s Chase file.</p>
 <hr>
 <h2 id="the-card-number-never-visits-my-server">The card number never visits my server</h2>
 <p><a href="/images/pci-tokenization.png"><img src="/images/pci-tokenization.png" alt="PCI tokenization: card number goes browser to processor iframe to Stripe; the server only gets a token"></a></p>
@@ -326,7 +416,7 @@ The tap is not. I would not put the authorization response on a queue and hope K
 <hr>
 <h2 id="what-i-would-refuse-to-say">What I would refuse to say</h2>
 <ul>
-<li>“We’ll find the captured rows and send them.” Without an index, a group-by-acquirer, a batch key, and an ack, that sentence is fan fiction.</li>
+<li>“We’ll find the captured rows and send them.” Without an index, a group-by-acquirer, part files, a cursor on <code>payment_id</code>, and an ack, that sentence is fan fiction.</li>
 <li>“Eventual consistency is fine for payments.” It is fine for the thank-you email.</li>
 <li>“We don’t store cards, so we can’t recon per bank.” We store <code>acquirer_id</code>.</li>
 <li>“I’ll put the tap on Kafka so it’s scalable.” I’ll put the tap on Kafka so it’s slow.</li>
