@@ -185,7 +185,27 @@ I start with something I could draw in a few minutes: the *core* — API, expand
 
 Then the scale pass, given the number above. More than one API machine, so a load balancer. More than one Postgres, so a shard map and a connection waiting room. A queue so Alice's save does not wait for 200 copies. A cache only if the same March is opened all day. Search and busy-bits sit off the month-view path on purpose.
 
-I would start on **Postgres**. Something like Cassandra — a database built for huge keyed writes, weaker transactions — is a later conversation, if someone is actually pushing scale. I want one transaction for "delete this series and its exceptions." That is the rationale. Scale by splitting calendars, not by switching storage brands in minute two.
+I would start on **Postgres**. Scale by splitting calendars, not by switching storage brands in minute two.
+
+**Postgres (or any SQL with real transactions).**
+
+- Pro: "delete this series and its exceptions and the outbox row" is one `COMMIT`.  
+  *Why:* those rows must not diverge. Recurrence edits are several tables, not one blob.
+- Pro: `WHERE version = 4` on an update is a booking lock you can explain.  
+  *Why:* two tabs, or find-a-time racing a book, need a row version — not a Redis lock you forget to release.
+- Con: one instance will not hold hundreds of millions of people.  
+  *Why:* CPU, disk, vacuum, connections. That is why we shard by `calendar_id`, not why we throw away SQL.
+
+**Cassandra / wide-column / "huge keyed writes."**
+
+- Pro: writes scale by key without you drawing a shard map on day one.  
+  *Why:* the product is built for that.
+- Con: "delete series + exceptions + outbox" is no longer one transaction unless you denormalize into one partition and give up joins.  
+  *Why:* weaker multi-row ACID is the trade. A half-applied "this and following" split is a wrong Tuesday.
+- Con: month view is a range, not a point get.  
+  *Why:* calendars are `WHERE calendar_id = ? AND first_start < timeMax`. SQL indexes that. A key-value store wants you to model the range yourself.
+
+Cassandra is a later conversation if someone is actually pushing a write-heavy, key-shaped workload. Month view is not that.
 
 ---
 
@@ -260,7 +280,28 @@ Create / edit / delete is then one database transaction: all succeed or all fail
 
 Alice's calendar → shard A. Bob's → shard B. A meeting Alice organizes is *born* on A. A copy is later written to B.
 
-Sharding by `event_id` would make "show March" hit every machine — the range-query bottleneck, made worse. Starting unsharded is fine. I'd shard when disk or vacuum start to hurt.
+**`calendar_id`. This is the one I'd take.**
+
+- Pro: month view, share list, and almost every write are one host.  
+  *Why:* the product query is "Alice / Work, March," not "event 7f3a." Related rows travel together because I put them together.
+- Con: invites and find-a-time cross shards.  
+  *Why:* Bob's copy is on B. That is scatter-gather or async fan-out — the interesting part, not a reason to pick a worse key.
+
+**`event_id`.**
+
+- Pro: writes spread evenly. No giant calendar row-hotspot from hashing.  
+  *Why:* ids are unique. Each insert can land anywhere.
+- Con: `GET /calendars/{id}/events?timeMin=&timeMax=` hits every machine.  
+  *Why:* March is a range on one calendar. You turned the read bottleneck into scatter-gather on every open. I would not.
+
+**`user_id`.**
+
+- Pro: "all my calendars" is local. Per-user copies sit together.  
+  *Why:* the key is the person. A settings page and a reminder sweeper like that.
+- Con: a shared work calendar is still one document many people open.  
+  *Why:* you either put it on the owner's user shard (hot tenant) or you copy it (you are back to copies, with a worse home for the series). `calendar_id` names the container people actually query.
+
+Starting unsharded is fine. I'd shard when disk or vacuum start to hurt.
 
 I'd also index `(calendar_id, first_start)` on that shard. That is the cheap scale pass for "open March": a range on one machine, not a scan, and not Redis yet.
 
@@ -335,6 +376,24 @@ I run this in the API after SQL returns. Some diagrams hang it next to the shard
 
 I don't expand on the phone. I don't pre-write ten years of Tuesdays. Caching the next 18 months is optional if free/busy traffic hurts. The source of truth stays the rule.
 
+**Insert ten years of Tuesday rows (materialize).**
+
+- Pro: `GET` is a date-range query. No expander in the API.  
+  *Why:* every instance is a row. SQL already knows how to filter `start` / `end`.
+- Con: "this and following" rewrites hundreds or thousands of rows.  
+  *Why:* you stored the instances. Changing the rule is a bulk update, and you will get it wrong at a daylight-saving boundary.
+- Con: disk and indexes grow with lifetime, not with "what is on screen."  
+  *Why:* a weekly meeting for ten years is ~500 rows before anyone opens March. The product is a generator.
+
+**Expand on read in the window. This is the one I'd take.**
+
+- Pro: persist the rule + exceptions. March is four or five instances of CPU.  
+  *Why:* cost is the window, not the lifetime. DST is applied when you generate, from a timezone database.
+- Con: every month view pays expander CPU.  
+  *Why:* that is real. Cache the expanded month in Redis if the same March is opened all day — still rebuildable from Postgres.
+- Con: two phones expanding the same rule will disagree.  
+  *Why:* so the *server* expands. The phone only paints.
+
 Cost is the number of meetings in the window, not the lifetime of the series. A weekly meeting for ten years is still four or five rows in March.
 
 ### Outbox
@@ -347,7 +406,18 @@ If I COMMIT then publish to the queue and the publish fails, Bob never gets the 
 
 This is the scale pass for the *second* bottleneck: fan-out. A log of messages. Alice saving a meeting stays fast. Updating 200 attendee copies is slow and retryable, so it happens after. The rationale is write latency, not "we need a queue."
 
-**Month view does not read the queue.** If a GET for March goes through a queue, I overdesigned the read path. Any boring queue is fine if nobody cares about the brand.
+**Month view does not read the queue.** Any boring queue is fine if nobody cares about the brand.
+
+**Put `GET /events` on a queue (worker expands, then replies).**
+
+- Pro: a burst of March opens does not stampede Postgres; they wait in line.  
+  *Why:* that is what queues do — absorb.
+- Con: the grid waits on enqueue + a worker + the database anyway.  
+  *Why:* a month view is a request/response. Adding a broker does not make expansion cheaper; it makes P99 worse and the client harder (you need a job id, polling, or a callback).
+- Con: reads dominate. You just put the hot path on the slow path.  
+  *Why:* queues are for fan-out and reminders — work that can be late. Alice staring at March cannot.
+
+**RPC to the home shard, expand in the API. This is the one I'd take.** The queue is only after COMMIT, for copies.
 
 ### Fan-out, copies, idempotent upsert
 
@@ -355,29 +425,89 @@ Fan-out is mail merge: one organizer write, many attendee writes.
 
 Google's model is **copies**. Bob gets his own row on his shard. He can add a private reminder and a color. When Alice changes the title, a worker overwrites the *shared* fields on that copy and leaves Bob's reminder alone.
 
-The other model is a **pointer**: Bob only stores "I was invited to event X." One source of truth, worse for offline and privacy. I'd use pointers for a v0 calendar inside a Notion page; copies for a consumer Google Calendar.
+**Copies.**
+
+- Pro: Bob's month view is one shard, including private fields. Offline and "my color" work.  
+  *Why:* the row is on Bob's machine. No live join to Alice at read time.
+- Pro: Alice's save does not wait on Bob's database.  
+  *Why:* she commits locally; fan-out is async.
+- Con: a title change is N writes. Eventually consistent for attendees.  
+  *Why:* that is the fan-out you accepted. Retry with `source_version`.
+- Con: you can briefly show a stale title on Bob's phone.  
+  *Why:* the copy lags. Booking still uses a version check on the organizer.
+
+**Pointers** (Bob stores "I was invited to event X").
+
+- Pro: one source of truth. No fan-out of titles.  
+  *Why:* everyone reads Alice's row (or a cache of it).
+- Con: Bob's month view becomes scatter-gather, or a cache you must invalidate.  
+  *Why:* his grid is not on his shard anymore.
+- Con: private reminder and color have nowhere obvious to live. Offline is worse.  
+  *Why:* the pointer is not a document he owns.
+
+I'd use pointers for a v0 calendar inside a Notion page; copies for a consumer Google Calendar.
 
 The worker writes with `(source_event_id, attendee_calendar_id, version)`. Running twice is the same as running once.
 
 ### I would not lock two databases as one
 
-That is the "two-phase commit" trick: try to make two databases commit together. If Bob's shard is down, Alice couldn't create a meeting. Slow, easy to deadlock.
+That is the "two-phase commit" trick: try to make two databases commit together.
+
+- Pro: Alice and Bob either both have the meeting or neither does, in one shot.  
+  *Why:* that is the definition of a distributed transaction.
+- Con: if Bob's shard is down, Alice cannot create a meeting.  
+  *Why:* 2PC waits on every participant. Availability becomes the weakest shard.
+- Con: slow, easy to deadlock, operationally cursed.  
+  *Why:* locks across machines, coordinator crashes, in-doubt transactions.
 
 Instead: COMMIT on the home shard. The meeting exists. Fan-out eventually updates copies. Retry if B is down. Alice's calendar is already correct.
+
+- Pro: Alice's write latency is one database.  
+  *Why:* no second round-trip in the save path.
+- Con: Bob can be briefly missing the invite.  
+  *Why:* async. The outbox + retry is how you close the gap without 2PC.
 
 Cross-shard is async. No distributed commit.
 
 ### Catching every database write
 
-Postgres keeps a diary of every change. A capture tool can tail that diary into the queue so search, busy-bitmaps, and a data lake see *all* writes — including ones a script made — not only the ones the API remembered to publish.
+Postgres keeps a diary of every change.
 
-The outbox is enough for invite fan-out. Tailing the diary is how I'd keep search honest.
+**Only the outbox (API remembers to insert a row).**
+
+- Pro: one transaction with the event. No extra pipeline.  
+  *Why:* invite fan-out is exactly the writes the API made.
+- Con: a SQL script, a migration, a support `UPDATE` never publishes.  
+  *Why:* search and busy-bits would miss those rows. The API is not the only writer forever.
+
+**Tail the diary (CDC) into search / bitmaps / the lake. This is the one I'd take for projections.** The outbox stays for invite fan-out — that write has to commit with the event.
+
+- Pro: every write shows up, including ones a script made.  
+  *Why:* the WAL does not care who issued the SQL.
+- Con: CDC is at-least-once and lagged. Do not use it to *create* Bob's meeting copy as the only path.  
+  *Why:* invites need the outbox in the same `COMMIT`. Search can be late. Bob's calendar should not depend on a connector.
 
 ### Busy-bitmap
 
 This is the scale pass for find-a-time when the attendee list is large. A projection, not the source of truth. For each person, something like 14 days × 15-minute slots: 0 free, 1 busy.
 
-Find-a-time for 20 people shouldn't expand 20 repeating rules on every keystroke. A few seconds of staleness might suggest a slot that just got booked. **Booking** still writes the real event with a version check. For 20 people, asking each calendar is fine. I'd name the bitmap at 200.
+**Scatter-gather: expand each attendee's calendar on the request.**
+
+- Pro: always as fresh as Postgres. No extra store.  
+  *Why:* you run the same expander you trust for March.
+- Con: 200 attendees × expand is 200 shard hops on a keystroke.  
+  *Why:* find-a-time is interactive. CPU and scatter grow with N, not with the window alone.
+
+**Busy bitmap. I'd name this at ~200 people.**
+
+- Pro: a few bit-ANDs instead of 200 expands.  
+  *Why:* 14 days × 15 minutes is a small bitset. Intersection is CPU, not SQL.
+- Con: a few seconds of staleness can suggest a slot that just got booked.  
+  *Why:* the bitmap lags the write. **Booking** still writes the real event with a version check — the bitmap is a hint, not a lock.
+- Con: you must rebuild it when Redis dies.  
+  *Why:* it is a projection. Outbox or CDC feeds it; Postgres remains the truth.
+
+For 20 people, asking each calendar is fine.
 
 ### Data lake and search
 
@@ -389,7 +519,23 @@ After a write I publish `calendar abc changed`. A WebSocket is a long-lived conn
 
 I send an invalidate, not a stream of tiny typing operations. Live co-editing is for two people in one paragraph. The wrong tool here.
 
-Polling every 30 seconds also works.
+**Poll every 30 seconds.**
+
+- Pro: no socket fleet. Every phone already knows HTTP.  
+  *Why:* `GET` with `If-None-Match` / a cursor is boring and debuggable.
+- Con: a move of 3pm can sit for half a minute.  
+  *Why:* that is the poll interval. Fine for a calendar; rude if you promised "seconds, not minutes."
+- Con: idle clients still hit the API.  
+  *Why:* 10 opens a day × 30s polls while the tab is open is more read QPS than the writes.
+
+**WebSocket (or SSE) "this calendar changed," then the client refetches. This is the one I'd take if the tab is open.**
+
+- Pro: the grid feels fresh in seconds without co-editing.  
+  *Why:* you push an invalidate, not operational transforms. One refetch hits the expander you already trust.
+- Con: you hold connections.  
+  *Why:* calendars are not chess — idle tabs. Heartbeats and gateways, or just poll, if the interview is not about realtime.
+
+Polling every 30 seconds also works for a v0. I would not stream keystrokes on an event.
 
 ### Reminder sweeper
 
@@ -520,11 +666,7 @@ Calendar API
 
 ## Sharding, if I think like a datastore team
 
-The partition key I'd defend is **`calendar_id`**. It's the workspace-id move: month view, share list, and almost every write stay on one host. Invites and find-a-time become the cross-shard problems — which is the interesting part.
-
-`user_id` is nicer for "all my calendars" and per-user copies, and then every shared calendar fans out. `event_id` kills range queries.
-
-On the home shard, in one transaction:
+The partition key I'd defend is **`calendar_id`**. I already listed the others: `event_id` kills range queries; `user_id` is nicer for "all my calendars" and then every shared calendar fans out. On the home shard, in one transaction:
 
 ```
 Calendar, EventSeries, EventException, CalendarAcl, local Reminders
@@ -542,17 +684,18 @@ I wouldn't open this design with a key-value store as the system of record, or w
 
 ## Trade-offs I keep coming back to
 
-The scale pass is just these choices with a number attached. Each line is a decision I already made, and why I would not flip it in minute one.
+The scale pass is just these choices with a number attached. The *why* for each fork is in the sections above. This table is the short map.
 
-| Question | Where I am |
-|---|---|
-| Materialize vs expand | Expand on read for the UI. Materialize a horizon if free/busy traffic hurts. |
-| Copy vs pointer | Copies for per-user privacy and sync. Pointers for a simple embedded calendar. |
-| SQL vs something else | SQL until a single calendar is truly huge. Shard by `calendar_id`. |
-| Realtime | Invalidate the open view. Don't co-edit the event. |
-| Idempotency | Client `request_id` on create; fan-out on `source_version`. |
-| Calendar vs scheduler | Find-a-time grows with attendees × window. Rooms and constraints are another service. |
-| Redis | Derived data only. |
+| Question | Where I am | Why, in one line |
+|---|---|---|
+| Materialize vs expand | Expand on read | Instances are CPU in a window; "this and following" must not rewrite ten years of rows |
+| Copy vs pointer | Copies | Bob's month view and private fields stay on his shard; Alice's save does not wait |
+| 2PC vs async | Async + outbox | Alice must be able to create a meeting if Bob's shard is down |
+| Shard key | `calendar_id` | March view is one host; `event_id` makes every open scatter-gather |
+| Queue on GET? | No | Reads dominate; a broker on month view only adds hops |
+| SQL vs Cassandra | SQL, then shard | Recurrence edits are several rows in one transaction |
+| Realtime | Invalidate, don't co-edit | A calendar is not a doc; refetch the expander |
+| Redis | Derived data only | If Redis dies, March still has to be right |
 
 A few questions I like asking myself:
 
