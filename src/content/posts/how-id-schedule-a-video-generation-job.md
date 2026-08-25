@@ -1,12 +1,12 @@
 ---
-title: "How I'd schedule a video generation job"
-description: "A Sora-like pipeline is a task queue on a GPU pool that can vanish. Leases, fencing tokens, checkpoints, and what you do when the box dies at minute nine."
+title: "How I'd design Sora"
+description: "Sora is a task queue on a GPU pool that can vanish. Leases, fencing tokens, checkpoints, and what you do when the box dies at minute nine."
 pubDate: 2026-08-25
 tags:
   - systems
 ---
 
-A text-to-video API looks like a prompt and an MP4. The product is: take the job, put it on a GPU, survive the GPU disappearing, and never run the same video twice.
+Sora looks like a prompt and an MP4. The product is: take the job, put it on a GPU, survive the GPU disappearing, and never run the same video twice.
 
 Generation takes minutes. The public request cannot sit open until the file exists. The pool is not a web fleet — one worker, one video, and the machine may be a spot instance that dies with a two-minute warning or with none. Prompt safety, billing, and moderation sit upstream. This note is the scheduler, the worker, and every way that pair fails.
 
