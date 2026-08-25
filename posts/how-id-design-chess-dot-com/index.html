@@ -19,6 +19,7 @@
 <p>The board on your phone is a display. The clock on your phone is a display. The server is the boss of both. If we get that wrong, people leave — not because we ran out of RAM, but because the game felt unfair.</p>
 <p>This note walks through that system in the order I’d teach it. One game so the words mean something. Then the records, the APIs, matchmaking, a move, the clock. After that the part people wave at: <strong>serialization</strong> — why one game can only have one writer, and what happens when your laptop and your phone both try to move. Then reconnects, and what changes at 80,000 games at once.</p>
 <p>Assume standard 1-vs-1. No tournaments, no bots, unless someone asked.</p>
+<p><a href="/images/chess-design.png"><img src="/images/chess-design.png" alt="Whiteboard for an online chess site: requirements, scale, tables, APIs, and a game shard that serializes, dedupes, and checks each move"></a></p>
 <hr>
 <h2 id="1-one-game-start-to-finish">1. One game, start to finish</h2>
 <p>Alice wants blitz, 5 minutes plus 3 seconds per move, rated. Bob wants the same.</p>
