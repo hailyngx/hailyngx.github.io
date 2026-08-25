@@ -20,7 +20,11 @@ I picked Qwen 2.5 7B because it fits. 3B was cheaper and dumber. 14B would have 
 
 The first version asked the model to rewrite the whole `.tex`. I got empty PDFs and a very confident preamble. A 7B is a wording engine, not a typesetter. Now I keep the Jake template, rewrite bullets in chunks, sort the tools in the role line by hand so it does not invent a new job, and fit one page by clipping — not by crushing `\vspace` until Education sits on top of Experience. If a rewrite drops too many of the original nouns, I throw it out. I'd rather a slightly generic bullet than "Waymo" appearing in a job that was not Waymo.
 
-I would not ship off one happy PDF. I scraped live jobs off Waymo's careers page and used those as the benchmark: simulation infrastructure, ML/eval data, simulator orchestration, SRE. For each listing I generated a tailored resume, read it like a recruiter, changed the splice, and ran it again. I stopped when I'd actually send that PDF, not when a script looked happy. The systems I built have to still be in there. "Waymo" cannot show up on a job that was not Waymo. It still has to fit one page.
+I would not ship off one happy PDF. I scraped live jobs off Waymo's careers page and used those as the benchmark: simulation infrastructure, ML/eval data, simulator orchestration, SRE.
+
+The loop was the same four listings, every round. Generate. Read it like a recruiter — phone screen, or bounce for lying. Then score the boring checks: did the JD's languages and nouns actually show up, are the systems I built still in the bullets, did "Waymo" leak into a job that was not Waymo, did LaTeX eat a backslash and print garbage, did we glue on a tool the posting never asked for. Change one thing in the splice. Run the four again.
+
+That is how asking the model for a whole `.tex` died. That is how role titles stopped being the model's to invent. That is how one page became "cut a bullet" instead of shrinking the template until Education sat on Experience. I stopped when the simulation-infra and ML/eval versions were something I'd send. Orchestration stayed a stretch. SRE stayed weak if the posting wanted on-call I do not have. A script can count keywords. I still had to look at the PDF.
 
 Proxmox, Ethernet, a second PC, Kubernetes — later, if I ever have a second product. I cannot un-buy a mini PC I put in the closet. Wi-Fi is fine. A JD and a PDF do not care that the NIC is a Realtek.
 
