@@ -20,7 +20,7 @@ I picked Qwen 2.5 7B because it fits. 3B was cheaper and dumber. 14B would have 
 
 The first version asked the model to rewrite the whole `.tex`. I got empty PDFs and a very confident preamble. A 7B is a wording engine, not a typesetter. Now I keep the Jake template, rewrite bullets in chunks, sort the tools in the role line by hand so it does not invent a new job, and fit one page by clipping — not by crushing `\vspace` until Education sits on top of Experience. If a rewrite drops too many of the original nouns, I throw it out. I'd rather a slightly generic bullet than "Waymo" appearing in a job that was not Waymo.
 
-I would not ship off one happy PDF. Paste a live listing, generate, read it like a recruiter, score it, change the splice, do it again. Stop when I'd actually send it, not when a script is loud. Waymo was the bench: sim infra, ML/eval data, simulator orchestration, SRE. Keywords that should show up. Systems that have to stay mine. Leaks that have to stay out. LaTeX that still compiles to one page.
+I would not ship off one happy PDF. I pasted real Waymo job posts — simulation infrastructure, ML/eval data, simulator orchestration, SRE — generated a tailored resume for each, read it like a recruiter, changed the splice, and ran it again. I stopped when I'd actually send that PDF, not when a script looked happy. The systems I built have to still be in there. "Waymo" cannot show up on a job that was not Waymo. It still has to fit one page.
 
 Proxmox, Ethernet, a second PC, Kubernetes — later, if I ever have a second product. I cannot un-buy a mini PC I put in the closet. Wi-Fi is fine. A JD and a PDF do not care that the NIC is a Realtek.
 
