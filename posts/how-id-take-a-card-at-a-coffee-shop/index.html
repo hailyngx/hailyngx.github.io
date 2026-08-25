@@ -43,7 +43,25 @@
 <p>Wallets, peer-to-peer, subscriptions, and a full merchant dashboard can wait. They don’t change the till.</p>
 <p>Four questions hide most of the rest of the design. Answer them before you add a queue.</p>
 <p><strong>Hold then capture, or one charge?</strong><br>
-Two steps. Hotels hold at check-in and capture at checkout. Amazon authorizes at order and captures at ship. A coffee shop holds at tap and captures after the tip. One <code>charge</code> call can’t change the amount, so it can’t do the tip screen.</p>
+Two steps. Hotels hold at check-in and capture at checkout. Amazon authorizes at order and captures at ship. A coffee shop holds at tap and captures after the tip.</p>
+<p><strong>One <code>charge</code> call (auth+capture together).</strong></p>
+<ul>
+<li>Pro: one network round trip, one state (<code>captured</code> or <code>failed</code>).<br>
+<em>Why:</em> fewer attempts to reconcile. A website with a known total likes this.</li>
+<li>Con: you cannot change the amount after the bank said yes.<br>
+<em>Why:</em> the issuer locked $4.75. A $1 tip is a second charge or a guess before they tap.</li>
+<li>Con: a guessed tip that they skip is money you have to refund.<br>
+<em>Why:</em> capture already moved it. Refund is another attempt, another dispute surface.</li>
+</ul>
+<p><strong>Hold, then capture. This is the one I’d take for a till.</strong></p>
+<ul>
+<li>Pro: the tip screen is a second amount on the same payment.<br>
+<em>Why:</em> capture can be $5.75 after a $4.75 hold (within the network’s rules). One intent, two attempts.</li>
+<li>Con: two calls, two timeouts, two idempotency keys.<br>
+<em>Why:</em> that is real. It is still cheaper than a second charge or a refund for a skipped tip.</li>
+<li>Con: a hold that never captures must expire or cancel.<br>
+<em>Why:</em> you left money locked. That is a sweeper, not a reason to merge the calls.</li>
+</ul>
 <p><strong>Who is “the bank”?</strong><br>
 Three companies, and people mash them together:</p>
 <ul>
@@ -93,6 +111,15 @@ Not the tap. Settlement, emails to the back office, reconciling the result file:
 </ul>
 <p>A document store or a wide-column store can hold JSON. They make the <em>next</em> sentence hard: “those four writes either all happened or none did.” Redis can cache the idempotency lookup. It is not the source of truth for money. If Redis restarts, the unique row in Postgres is still there.</p>
 <p>I would not start on a ledger in Kafka, or on a database that only offers eventual consistency for the tap. Eventual is for the receipt email.</p>
+<p><strong>Relational (Postgres) vs document / wide-column vs “the log is the ledger.”</strong></p>
+<ul>
+<li>Relational — Pro: one <code>BEGIN</code> covers payment + attempts + two ledger rows; unique keys and check constraints. Con: you will shard later by <code>merchant_id</code>.<br>
+<em>Why pro:</em> money is several rows that must not diverge. <em>Why con:</em> one instance will not hold a global chain forever — that is a scale pass, not a reason to skip ACID on day one.</li>
+<li>Document store — Pro: dump a payment blob. Con: “update status and append two ledger lines atomically” becomes application luck.<br>
+<em>Why:</em> most document DBs do not give you multi-document transactions as the default mental model. A crash between two writes is a dispute.</li>
+<li>Kafka as the ledger — Pro: you never lose the stream of events. Con: the register cannot wait for a consumer to say “authorized.”<br>
+<em>Why:</em> a log is at-least-once and async. The person is at the counter. Use the log after capture, not instead of Postgres on the tap.</li>
+</ul>
 <hr>
 <h2 id="4-the-api">4. The API</h2>
 <p>The card reader talks to us; we talk to a bank. Two calls do almost all of the product:</p>
@@ -189,7 +216,23 @@ Not the tap. Settlement, emails to the back office, reconciling the result file:
 <li>The gateway asks the bank to <strong>authorize</strong>. (The sketch says “charge”; label that arrow <code>auth</code>. We have not captured yet.)</li>
 <li>Approve comes back. Receipt prints. Customer puts the card away.</li>
 </ol>
-<p>Some designs put step 3 on a queue: the API returns, a worker calls the bank later. That decouples a slow bank from a website, where the customer is already on a “processing” screen. At a counter it means the person waits on your queue. Call the bank <strong>in the request</strong>. Queues are for 10pm and for “tell the store’s other software.”</p>
+<p>Some designs put step 3 on a queue: the API returns, a worker calls the bank later.</p>
+<p><strong>Authorize on a queue.</strong></p>
+<ul>
+<li>Pro: a slow bank does not hold HTTP threads. The website can show “processing.”<br>
+<em>Why:</em> the customer already left the button. Decoupling helps <em>that</em> product.</li>
+<li>Con: at a counter the person is waiting on your queue depth, not on the bank.<br>
+<em>Why:</em> you added a hop. P99 is now broker + worker + bank. The receipt is late.</li>
+<li>Con: “approved” can sit in a partition while they put the card away.<br>
+<em>Why:</em> at-least-once delivery is not a yes/no in 300ms.</li>
+</ul>
+<p><strong>Call the bank in the request. This is the one I’d take for a till.</strong> Queues are for 10pm and for “tell the store’s other software.”</p>
+<ul>
+<li>Pro: one round trip. The reader blocks on the issuer, which is the real latency.<br>
+<em>Why:</em> no extra hop you control.</li>
+<li>Con: a stuck bank occupies a request worker.<br>
+<em>Why:</em> timeouts and a pool cap are the fix — fail the tap — not a lie via Kafka.</li>
+</ul>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>  Card reader                   Our payment service           Banks</span></span>
 <span class="line"><span>  (wait for yes/no)             (orchestrator)</span></span>
 <span class="line"><span>       |                              |</span></span>
@@ -210,6 +253,24 @@ Not the tap. Settlement, emails to the back office, reconciling the result file:
 <h3 id="the-card-number-should-never-touch-us">The card number should never touch us</h3>
 <p><a href="/images/pci-tokenization.png"><img src="/images/pci-tokenization.png" alt="PCI tokenization: card number goes browser to processor iframe to Stripe; the server only gets a token"></a></p>
 <p>If the full card number, expiry, or CVC hits your API, logs, queue, or database, you fall under <strong>PCI DSS level 1</strong>: audits, key management, facility rules, a lot of cost. A misconfigured log that prints a PAN is a breach, not a bug.</p>
+<p><strong>Store the PAN yourself (encrypt it, “we’re careful”).</strong></p>
+<ul>
+<li>Pro: you can retry a bank without the terminal. Switching processors looks easy.<br>
+<em>Why:</em> you have the number.</li>
+<li>Con: you are now a card vault. PCI level 1 is the job.<br>
+<em>Why:</em> the number on <em>your</em> disk is the thing thieves want. Encryption does not remove the audit; it is the audit.</li>
+<li>Con: a debug log, a support export, a replica snapshot — any of them is a breach.<br>
+<em>Why:</em> PAN wants to leak. Tokens do not spend.</li>
+</ul>
+<p><strong>Tokenization (certified iframe / terminal → vault → <code>pm_abc123</code>). This is the one I’d take.</strong></p>
+<ul>
+<li>Pro: a leak of our database is not a leak of card numbers.<br>
+<em>Why:</em> we never saw the PAN. We store a stand-in the vault will accept.</li>
+<li>Pro: PCI scope shrinks to “we handle tokens.”<br>
+<em>Why:</em> the certified widget is on the processor’s path, not ours.</li>
+<li>Con: you cannot authorize if the vault is down, and switching processors means re-tokenizing.<br>
+<em>Why:</em> the number lives in their house. That is the fee you pay to not be a bank.</li>
+</ul>
 <p><strong>Tokenization</strong> is the fix: replace the number with a stand-in that is useless to a thief.</p>
 <ol>
 <li>Customer enters the card in a certified place — hosted fields on the web, a certified terminal in a shop.</li>
@@ -280,9 +341,32 @@ Each run has a <code>batch_id</code> / part id. Payments already tagged are skip
 <p>Uploads are usually capped at hundreds of MB. A 40GB put that dies at 97% starts over. Split on row count: 100,000 rows ≈ 50 MB → hundreds of <strong>part files</strong> per bank per day. Header can still say <code>batch_id</code>, <code>part 17 of 864</code>. Same logical batch, many objects.</p>
 <p>Receipt ack ≠ result. Don’t flip every payment to <code>settled</code> just because SFTP succeeded.</p>
 <h3 id="dont-use-a-change-feed-for-the-cutoff">Don’t use a change feed for the cutoff</h3>
-<p>CDC — every database write becomes an event — is fine for webhooks. It’s a bad way to decide “Tuesday’s Chase file.” Cutoff is a snapshot: <code>captured_at</code> before 10pm. After 10pm that set is frozen; a capture at 10:01 belongs to Wednesday. Feeds lag; shards lag differently. You double-send or drop a row.</p>
-<p>S3 isn’t a log you append line by line. You write a whole object. If you try to “stream CDC into S3,” you now own local part files, a worker that can die mid-part, and the nasty case <strong>object landed, database write did not</strong>. Then you have an orphan file and the next run doesn’t know those rows were already sent.</p>
-<p>Direct reads are simpler. Shard by <code>merchant_id</code>, read <strong>replicas</strong> so the 10pm scan does not sit on the tap’s primary. After cutoff the day’s captured rows do not move. Sort by <code>payment_id</code> and you always get the same order, so a restart rebuilds the same part.</p>
+<p><strong>CDC (every database write becomes an event) as the 10pm selector.</strong></p>
+<ul>
+<li>Pro: you already have a stream for webhooks and search. One pipe.<br>
+<em>Why:</em> the diary of writes exists. Reusing it looks cheaper than a second query.</li>
+<li>Con: cutoff is a frozen <em>set</em>, not “events we happened to see.” Feeds lag; shards lag differently.<br>
+<em>Why:</em> a capture at 9:59:50 can land in the stream at 10:00:20. A capture at 10:00:01 can appear first. You double-send Tuesday or drop a row into Wednesday’s file.</li>
+<li>Con: S3 is an object, not a log you append line by line.<br>
+<em>Why:</em> stream-into-S3 means local part files, a worker that can die mid-part, and the nasty case <strong>object landed, database write did not</strong>. Orphan file; next run does not know those rows were already sent.</li>
+</ul>
+<p><strong>Scan the primary at 10pm.</strong></p>
+<ul>
+<li>Pro: no replica lag. The <code>WHERE captured_at &#x3C; cutoff</code> set is exact.<br>
+<em>Why:</em> you are reading the same machine that took the tap.</li>
+<li>Con: 86 million rows of sequential read sit on the till’s database.<br>
+<em>Why:</em> settlement is a huge scan. Authorize is a 300ms point write. Mixing them makes the receipt wait on WAL and buffer cache from the night job.</li>
+</ul>
+<p><strong>Read replicas after cutoff, SQL snapshot. This is the one I’d take.</strong> Direct reads. Shard by <code>merchant_id</code>. After 10pm the day’s captured rows do not move.</p>
+<ul>
+<li>Pro: the set is defined by columns (<code>state</code>, <code>captured_at</code>, <code>batch_part_id</code>), not by consumer offset.<br>
+<em>Why:</em> <code>ORDER BY payment_id</code> always rebuilds the same part if you restart. That is a file, not a stream.</li>
+<li>Pro: the tap’s primary stays for holds and captures.<br>
+<em>Why:</em> the heavy read is on a follower. Authorize P99 does not share the scan.</li>
+<li>Con: a replica can be behind.<br>
+<em>Why:</em> if you query at 10:00:00 on a replica that is 30 seconds late, you miss rows that already committed on the primary. Wait until replay is past cutoff (or start the job at 10:05 once lag is known). Lag is a <em>delay</em>; CDC lag is a <em>wrong set</em>.</li>
+</ul>
+<p>Sort by <code>payment_id</code> and you always get the same order, so a restart rebuilds the same part.</p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>WHERE state = 'captured'</span></span>
 <span class="line"><span>  AND captured_at >= day_start AND captured_at &#x3C; cutoff</span></span>
 <span class="line"><span>  AND batch_part_id IS NULL</span></span>
@@ -307,7 +391,17 @@ Each run has a <code>batch_id</code> / part id. Payments already tagged are skip
 </ol>
 <p>Restart cursor: last committed <code>last_payment_id</code>, then <code>payment_id > that</code>. Uncommitted work is still <code>captured</code> and will be picked again. That’s why we sort.</p>
 <h3 id="recon-store-mismatches-dont-update-86-million-rows-at-once">Recon: store mismatches, don’t UPDATE 86 million rows at once</h3>
-<p>When the result file lands, most lines match. You do <strong>not</strong> need a second copy of every payment. You need an <strong>exception</strong> table for the rest:</p>
+<p>When the result file lands, most lines match.</p>
+<p><strong>One <code>UPDATE payments SET state = 'settled' WHERE batch_part_id = …</code> for the whole file.</strong></p>
+<ul>
+<li>Pro: one statement. Looks like the happy path.<br>
+<em>Why:</em> every row in the part posted, so flip them all.</li>
+<li>Con: 86 million rows in one transaction is a WAL and lock storm.<br>
+<em>Why:</em> Postgres has to write every row to the log and hold locks. A crash restarts the whole statement. The tap on that shard waits.</li>
+<li>Con: twelve rejects block or wrongly settle with the rest.<br>
+<em>Why:</em> the file is not all-or-nothing. Mixing “posted” and “rejected” in one UPDATE is how you lie.</li>
+</ul>
+<p><strong>Exception table + chunked updates. This is the one I’d take.</strong> You do <strong>not</strong> need a second copy of every payment. You need an <strong>exception</strong> table for the rest.</p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>SettlementException</span></span>
 <span class="line"><span>  acquirer_id, business_date, part_id</span></span>
 <span class="line"><span>  payment_id          -- null if they have a line we don't</span></span>
@@ -322,6 +416,29 @@ Each run has a <code>batch_id</code> / part id. Payments already tagged are skip
 <p>The till already knows the latte happened. The store’s other software — inventory, payroll, a tablet in the back — shouldn’t poll “is it captured yet?” every few seconds. We <strong>POST</strong> them when something important happens.</p>
 <p><a href="/images/webhook-delivery.png"><img src="/images/webhook-delivery.png" alt="Webhook pipeline: payments DB to CDC to Kafka to a delivery worker posting to the merchant, with backoff and a DLQ"></a></p>
 <p><strong>Do not wait for their server before you print the receipt.</strong> If inventory is down, the latte still happened.</p>
+<p><strong>Their software polls <code>GET /payments</code> every few seconds.</strong></p>
+<ul>
+<li>Pro: you do not run a dispatcher. Their outage is their problem.<br>
+<em>Why:</em> no HMAC, no retry schedule, no dead-letter queue on your side.</li>
+<li>Con: 10,000 stores × a poll is empty work, and they still learn late.<br>
+<em>Why:</em> most GETs return “nothing new.” Capture already happened at the counter; they are reconstructing it from a pull.</li>
+</ul>
+<p><strong>POST them from our request, wait for 200, then print.</strong></p>
+<ul>
+<li>Pro: inventory is never behind the receipt.<br>
+<em>Why:</em> you serialized two companies in one HTTP call.</li>
+<li>Con: their timeout is now the customer’s timeout.<br>
+<em>Why:</em> the till should not care if payroll is down. That is the whole point of an outbox.</li>
+</ul>
+<p><strong>Outbox row in the same commit as <code>captured</code>, dispatcher later. This is the one I’d take.</strong></p>
+<ul>
+<li>Pro: the receipt does not wait. The event cannot vanish if we crash.<br>
+<em>Why:</em> <code>BEGIN</code> writes payment + ledger + <code>webhook_events</code>. Commit. A worker POSTs. At-least-once; their idempotency key makes the extra POST safe.</li>
+<li>Con: they can be seconds behind.<br>
+<em>Why:</em> that is allowed. The customer already left. Back office is not the tap.</li>
+<li>Con: you now operate retries, HMAC, a dead-letter queue.<br>
+<em>Why:</em> cheaper than blocking the register, and cheaper than 10,000 polls.</li>
+</ul>
 <p>How: in the <strong>same database transaction</strong> that sets <code>captured</code> (or <code>settled</code>), insert a <code>webhook_events</code> row. That’s the durable trigger — the outbox idea again. A <strong>dispatcher</strong> (a separate service) reads new rows, or a queue, and HTTP POSTs the store.</p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>WebhookEvent</span></span>
 <span class="line"><span>  event_id</span></span>
@@ -349,10 +466,26 @@ Each run has a <code>batch_id</code> / part id. Payments already tagged are skip
 <hr>
 <h2 id="12-if-this-gets-bigger">12. If this gets bigger</h2>
 <p><strong>Shard key</strong> is the id you split data on. Pick it for the queries you actually run.</p>
+<p><strong><code>payment_id</code>.</strong></p>
 <ul>
-<li><code>payment_id</code> — writes spread evenly; a store’s day and a bank’s 10pm file hit every machine. Skip this first.</li>
-<li><code>merchant_id</code> / <code>store_id</code> — Oakland 12 lives together. Default. Watch a huge franchise stuffed under one id.</li>
-<li><code>acquirer_id</code> — 10pm grouping is local, but one store that uses two banks spans machines. Only if settlement is the main workflow.</li>
+<li>Pro: writes spread evenly. No hot store.<br>
+<em>Why:</em> ids are random-ish. Each insert hits a different machine.</li>
+<li>Con: Oakland 12’s day and Chase’s 10pm file touch every shard.<br>
+<em>Why:</em> “all captured rows for this store” and “all rows for this acquirer” become scatter-gather. Settlement is the workload that hurts.</li>
+</ul>
+<p><strong><code>merchant_id</code> / <code>store_id</code>. This is the one I’d take first.</strong></p>
+<ul>
+<li>Pro: one store’s taps, tips, and refunds live together. Statements are local.<br>
+<em>Why:</em> the product query is “what did Oakland 12 do today,” not “payment 7f3a.”</li>
+<li>Con: a huge franchise under one id becomes a hot shard.<br>
+<em>Why:</em> the key is the tenant. Split a hot tenant later; don’t pick a key that makes every night job global.</li>
+</ul>
+<p><strong><code>acquirer_id</code>.</strong></p>
+<ul>
+<li>Pro: 10pm grouping is already local.<br>
+<em>Why:</em> the file is <code>WHERE acquirer_id = Chase</code>.</li>
+<li>Con: one store with two banks spans machines. Support by store is scatter-gather.<br>
+<em>Why:</em> the till is store-shaped. Only pick this if settlement is the main workflow they will grade you on.</li>
 </ul>
 <p>Shard by store, run the 10pm job per shard, then stitch parts per bank if they want one logical batch.</p>
 <p>Ten times the taps: more API machines, a connection pool in front of Postgres (PgBouncer is a waiting room so you don’t open 10,000 database sockets), cache the idempotency lookup if it’s hot (cache is a hint; the unique row is the lock). Authorize stays live. If the bank is rate-limiting, the reader says busy — don’t lie with a queue.</p>

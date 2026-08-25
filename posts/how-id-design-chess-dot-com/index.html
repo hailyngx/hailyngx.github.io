@@ -109,9 +109,62 @@ Not the move. Not the clock check. Matchmaking under a few seconds is the other 
 <p>Player 1:N queue rows. Player 1:N games (as white or black). Game 1:N moves. Game 1:1 clock.</p>
 <p>The live board also sits in <strong>Redis</strong>: FEN, move number, clocks, version. Postgres is the log and the game row. Redis is so a reconnect does not wait on a disk join. When the game ends, drop it from Redis; keep Postgres.</p>
 <p>That is a <strong>relational</strong> store on purpose: foreign keys, unique (game_id, move_number), one transaction for “accept move + new FEN + new clocks.” Redis is not the source of truth for last month’s games.</p>
+<p>Three places the live state can live. I would pick the third.</p>
+<p><strong>Postgres only.</strong> Every move is a disk write, then a read for the opponent.</p>
+<ul>
+<li>Pro: if the process dies, the board is still in the database. There is one place to look.<br>
+<em>Why:</em> a committed row survives a reboot. You do not have a second store to forget to update.</li>
+<li>Pro: unique <code>(game_id, move_number)</code> is enforced by the same engine that stores the board.<br>
+<em>Why:</em> two writers racing lose on the unique index, not on a cache that can reboot empty.</li>
+<li>Con: 10,000 moves/sec with a 150ms budget is a lot of fsyncs and row updates on hot games.<br>
+<em>Why:</em> a move is a read-modify-write on one row plus an insert. Disk and WAL are slower than RAM. P99 will miss 150ms when the same game is hot.</li>
+<li>Con: reconnect still waits on that disk path.<br>
+<em>Why:</em> <code>GET</code> has to join <code>Game</code> + last moves. Fine for history; sluggish for “I refreshed mid-blitz.”</li>
+</ul>
+<p><strong>Redis (or process memory) only.</strong> Fast. If the box dies, the game is gone.</p>
+<ul>
+<li>Pro: sub-millisecond get/set. Easy to hit 150ms.<br>
+<em>Why:</em> the working set is small (one FEN, two clocks). No WAL.</li>
+<li>Con: a crash mid-game deletes the position. Rated blitz cannot do that.<br>
+<em>Why:</em> RAM is not durable. Replication helps until both sides of a failover lose the key.</li>
+<li>Con: no durable unique constraint unless you reinvent it.<br>
+<em>Why:</em> Redis can <code>SETNX</code>; it is not your audit log for last month.</li>
+</ul>
+<p><strong>Hybrid — Redis for the live game, Postgres for the log. This is the one I’d take.</strong></p>
+<ul>
+<li>Pro: the tap is fast; history and disputes still have a row.<br>
+<em>Why:</em> apply in RAM, append <code>MoveEvent</code> (sync or almost-sync), snapshot in Redis. Reconnect reads Redis. Replay / fairness reads Postgres.</li>
+<li>Pro: when the game ends you delete the Redis key, so 80,000 games do not become 80 million.<br>
+<em>Why:</em> finished games do not need 150ms. Disk is cheaper for cold data.</li>
+<li>Con: two stores can disagree if you push to the socket before the insert commits.<br>
+<em>Why:</em> persist first, then broadcast. If you reverse that, a crash leaves clients ahead of the log.</li>
+<li>Con: you now operate Redis and Postgres.<br>
+<em>Why:</em> more failure modes (Redis full, replica lag). Worth it because neither store alone hits both latency and “no lost move.”</li>
+</ul>
 <hr>
 <h2 id="5-how-we-talk">5. How we talk</h2>
 <p>Setup and history are request/response. The game itself is a long-lived pipe.</p>
+<p><strong>HTTP for every move (the client polls, or POSTs and waits).</strong></p>
+<ul>
+<li>Pro: every load balancer and phone already speaks HTTP. Easy to debug.<br>
+<em>Why:</em> no upgrade, no sticky sockets, no “half-open TCP.”</li>
+<li>Con: the opponent only learns about e2e4 when they ask. That is not 150ms unless they poll every 50ms, which is waste.<br>
+<em>Why:</em> HTTP is request/response. The server cannot speak first.</li>
+<li>Con: 80,000 games × poll is a thundering herd.<br>
+<em>Why:</em> most polls return “nothing new.” You paid for 80,000 empty GETs.</li>
+</ul>
+<p><strong>WebSocket (or similar) for the live game. This is the one I’d take.</strong></p>
+<ul>
+<li>Pro: the server <strong>pushes</strong> the move and the clock. Both phones hear it without asking.<br>
+<em>Why:</em> one long-lived connection, frames in both directions. That is how you hit 150ms.</li>
+<li>Pro: reconnect is “open the socket again, send me the snapshot.”<br>
+<em>Why:</em> the gateway already knows the <code>game_id</code>.</li>
+<li>Con: you must hold connections (memory, load-balancer timeouts, mobile radios).<br>
+<em>Why:</em> a million idle sockets is a real bill. Gateways exist so game logic is not sitting on those sockets.</li>
+<li>Con: NAT and phone OS will kill idle connections. You need heartbeats.<br>
+<em>Why:</em> the pipe is not free forever. Heartbeat ≠ ticking the chess clock.</li>
+</ul>
+<p>REST stays for queue, history, and “load this finished game.” The socket is only the data plane.</p>
 
 
 
@@ -142,7 +195,7 @@ Not the move. Not the clock check. Matchmaking under a few seconds is the other 
 
 
 
-<table><thead><tr><th>Action</th><th>How</th><th>Why</th></tr></thead><tbody><tr><td>Join / leave queue</td><td>HTTP</td><td>Simple</td></tr><tr><td>Load a finished game</td><td>HTTP</td><td>Not live</td></tr><tr><td>Moves, clock, “you lost on time”</td><td>WebSocket</td><td>Server must push</td></tr><tr><td>Game service ↔ matcher</td><td>gRPC or HTTP inside the cluster</td><td>Typed, not the public internet</td></tr></tbody></table>
+<table><thead><tr><th>Action</th><th>How</th><th>Why</th></tr></thead><tbody><tr><td>Join / leave queue</td><td>HTTP</td><td>One shot, not a stream</td></tr><tr><td>Load a finished game</td><td>HTTP</td><td>Not live</td></tr><tr><td>Moves, clock, “you lost on time”</td><td>WebSocket</td><td>Server must push</td></tr><tr><td>Game service ↔ matcher</td><td>gRPC or HTTP inside the cluster</td><td>Typed, not the public internet</td></tr></tbody></table>
 <p>The WebSocket starts as HTTP. The client asks to <strong>upgrade</strong>. If the server agrees, you get <strong>101 Switching Protocols</strong> and the same TCP connection starts carrying WebSocket frames. REST is the control plane (queue, fetch history). The socket is the data plane (this move, this clock).</p>
 <p>HTTP we actually need:</p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>POST   /api/chess/queue</span></span>
@@ -174,10 +227,52 @@ Not the move. Not the clock check. Matchmaking under a few seconds is the other 
 <h2 id="6-finding-a-game">6. Finding a game</h2>
 <p>Two services, not one blob.</p>
 <p>The <strong>HTTP handler</strong> takes “put me in 5+0 rated.” It writes a <code>QueueEntry</code> and returns. It does not scan 16,000 waiters inside that request.</p>
-<p>The <strong>matcher</strong> is a separate worker. It consumes each <strong>bucket</strong> — time control + rated/casual + roughly a rating band + region — and pairs people. If you wait, the band <strong>widens</strong> (start ±50, then ±100, then ±200). Strict forever means a 2100 waits ten minutes. Instant forever means a 2100 plays a 900. Dynamic is the product.</p>
-<p>Keep queues <strong>separate</strong>. Do not dump 3-minute blitz into the same list as daily chess. The hot queue is “blitz 5+0.” Split it by region (US / EU / Asia) and by rating buckets so one Redis set is not a million members.</p>
-<p>In memory (Redis sets / sorted sets keyed by rating) you can insert and pop fast. When two ids match, <strong>atomically claim</strong> both entries (<code>waiting → matched</code>) so two matchers don’t pair Alice twice. Then the <strong>game service</strong> creates the <code>Game</code>, assigns colors, sets clocks, mints a short-lived join token, and tells both clients the WebSocket URL.</p>
-<p>If nobody is in your bucket, you wait. You are not a “failed request.” You are pending.</p>
+<p>The <strong>matcher</strong> is a separate worker. It consumes each <strong>bucket</strong> — time control + rated/casual + roughly a rating band + region — and pairs people.</p>
+<p>How wide is “similar rating”? Three policies:</p>
+<p><strong>Always strict (only ±50).</strong></p>
+<ul>
+<li>Pro: games feel fair. A 2100 rarely sits across from a 1600.<br>
+<em>Why:</em> the matcher refuses pairs outside the band, so skill gap stays small.</li>
+<li>Con: at off-peak, a 2100 waits minutes or never matches.<br>
+<em>Why:</em> there are few people in a tight band. The 5-second P95 dies.</li>
+<li>Con: the hottest band (everyone is ~1500 blitz) is still huge; the tails starve.<br>
+<em>Why:</em> strictness does not split the hot key. It only rejects pairs.</li>
+</ul>
+<p><strong>Always loose (anyone in 5+0 rated).</strong></p>
+<ul>
+<li>Pro: you almost always start a game in seconds.<br>
+<em>Why:</em> the pool is the whole mode, not a 50-point window.</li>
+<li>Con: a 2100 plays a 900. People rage-quit and tank ratings.<br>
+<em>Why:</em> “matched” optimized wait, not quality. Rated especially cannot eat that.</li>
+<li>Con: you still have a giant set to scan if you did not bucket.<br>
+<em>Why:</em> loose is a policy, not a data structure. One list of 16,000 is O(n) to search.</li>
+</ul>
+<p><strong>Start strict, widen with wait (±50, then ±100, then ±200). This is the one I’d take.</strong></p>
+<ul>
+<li>Pro: first seconds prefer a good game; if the queue is thin, you still play.<br>
+<em>Why:</em> the band is a function of <code>now - joined_at</code>. Early pairs are fair; late pairs are “good enough.”</li>
+<li>Pro: you can show the client “expanding search…” so the wait is honest.<br>
+<em>Why:</em> the policy is visible. People tolerate a slightly worse opponent more than a silent queue.</li>
+<li>Con: two people who waited a long time can still be a mismatch.<br>
+<em>Why:</em> the cap (±200) is a product knob. Set it, say it, don’t pretend it is perfect.</li>
+<li>Con: you must <strong>not</strong> mix time controls or rated/casual in the same bucket, or widening is meaningless.<br>
+<em>Why:</em> a 5+0 vs 10+5 pair is not “a bit worse rated.” It is a different game.</li>
+</ul>
+<p>Keep queues <strong>separate</strong>. The hot queue is “blitz 5+0.” Split it by region and rating buckets so one Redis set is not a million members.</p>
+<ul>
+<li>Pro of split-by-region: US-East plays US-East, clocks and RTT stay in budget.<br>
+<em>Why:</em> a move that crosses an ocean already burned the 150ms.</li>
+<li>Con: a thin region waits longer.<br>
+<em>Why:</em> fewer bodies in the bucket. Widen rating first, region second — or show “searching nearby, then worldwide.”</li>
+</ul>
+<p>HTTP handler vs matcher as <strong>two services</strong>:</p>
+<ul>
+<li>Pro: <code>POST /queue</code> returns in milliseconds. Pairing can loop for seconds.<br>
+<em>Why:</em> you do not hold an HTTP request open while you scan 16,000 waiters.</li>
+<li>Con: the waiter is pending until the matcher writes <code>matched</code> and you poll or get a push.<br>
+<em>Why:</em> that is the product (“searching…”), not a bug — as long as P95 stay under 5s.</li>
+</ul>
+<p>When two ids match, <strong>atomically claim</strong> both (<code>waiting → matched</code>) so two matchers don’t pair Alice twice. Then the game service creates the <code>Game</code>.</p>
 <hr>
 <h2 id="7-a-move-on-the-wire">7. A move, on the wire</h2>
 <p>Alice’s phone already has a socket to a <strong>WebSocket gateway</strong>. The gateway holds connections. The <strong>game service</strong> owns the rules.</p>
@@ -189,20 +284,41 @@ Not the move. Not the clock check. Matchmaking under a few seconds is the other 
 <li>Apply the move. New FEN. Checkmate / stalemate / draw by rule.</li>
 <li>Update the clock (next section).</li>
 <li><strong>Append</strong> <code>MoveEvent</code>. Update Redis snapshot. Optionally update <code>Game.current_fen</code> every N moves, not every ply — the log is the truth; the row is a cache for reconnects. On crash you load the last snapshot and <strong>replay the tail</strong> (a handful of moves), not 80 moves from the start.</li>
+</ol>
+<p><strong>Snapshot every move</strong> vs <strong>log + snapshot every N:</strong></p>
+<ul>
+<li>Every-move snapshot: reconnect is one row. Con: extra UPDATE per ply, write amplification at 10k/sec.<br>
+<em>Why:</em> FEN is derived from the log. Storing it 80 times in a game is cache, not new facts.</li>
+<li>Every-N or every-T seconds: less WAL. Con: failover replays up to N moves. Keep N small (10).<br>
+<em>Why:</em> 10 legal applies are milliseconds in the engine. 80 from move 1 is wasted CPU on reconnect.</li>
+</ul>
+<ol start="8">
 <li>Broadcast <code>game.move</code> to both sockets.</li>
 </ol>
 <p>Do not have the client poll. Push.</p>
 <hr>
 <h2 id="8-the-clock-do-not-tick-the-database">8. The clock (do not tick the database)</h2>
-<p>Writing remaining time every second at 80,000 games is a second 80,000 writes. We do not do that.</p>
-<p>We store:</p>
+<p><strong>Write remaining time every second (a tick).</strong></p>
 <ul>
-<li><code>white_remaining_ms</code>, <code>black_remaining_ms</code></li>
-<li>whose clock is running</li>
-<li><code>turn_started_server_ms</code> — server clock when that turn began</li>
-<li><code>version</code></li>
+<li>Pro: the row always equals what the UI shows. Easy to explain.<br>
+<em>Why:</em> you materialize <code>white_remaining_ms</code> 1, 2, 3, …</li>
+<li>Con: 80,000 games × 1 write/sec = 80,000 extra writes, for a number you can compute.<br>
+<em>Why:</em> elapsed time is <code>now - turn_started</code>. Storing it every second is a loop, not information.</li>
+<li>Con: two ticks and a move can race and jump the flag.<br>
+<em>Why:</em> the tick worker and the move worker both update the same row without a single writer.</li>
 </ul>
-<p>When a move arrives (or when a timeout worker wakes up):</p>
+<p><strong>Compute elapsed only on events (a move, a timeout alarm, a sync). This is the one I’d take.</strong></p>
+<ul>
+<li>Pro: work is proportional to moves (~10k/sec), not to wall-clock seconds.<br>
+<em>Why:</em> a 5-minute think is one subtraction when they finally move, not 300 updates.</li>
+<li>Pro: the server number is exact at the moment of the event, which is when fairness matters.<br>
+<em>Why:</em> flag fall is decided when we apply the move or when the alarm fires, using <code>now_server</code>.</li>
+<li>Con: between events the database does not show a ticking integer.<br>
+<em>Why:</em> you don’t need it. The client animates; we send <code>clock_sync</code> so it does not drift.</li>
+<li>Con: you must still <strong>schedule an alarm</strong> for “now + remaining,” or a disconnected player never flags.<br>
+<em>Why:</em> if nobody moves, no event arrives. The alarm is the event.</li>
+</ul>
+<p>We store remaining ms, whose clock is running, <code>turn_started_server_ms</code>, and a version. Formula:</p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>elapsed = now_server - turn_started_server</span></span>
 <span class="line"><span>time_left = old_time_left - elapsed</span></span>
 <span class="line"><span>if time_left &#x3C;= 0 → that side lost on time</span></span>
@@ -211,8 +327,14 @@ Not the move. Not the clock check. Matchmaking under a few seconds is the other 
 <span class="line"><span>turn_started_server = now_server</span></span>
 <span class="line"><span>version += 1</span></span></code></pre>
 <p>Worked example. 5+3. Alice has 180,000ms. Her turn started at server time 1000. She moves at 4000. Elapsed 3,000ms. She has 177,000ms, plus 3,000 increment → 180,000ms again. Bob’s clock starts at 4000.</p>
-<p>After we accept a move we <strong>schedule a timeout</strong> for “now + that side’s remaining.” If the timer fires, we look at the game. If they still have not moved, they lose. If they moved, the timer is a no-op.</p>
-<p>The phone still animates a ticking clock. Periodically we send <code>game.clock_sync</code> with <code>server_now_ms</code> so a laggy client can catch up. If Alice disconnects, <strong>the clock still runs</strong>. That is the product: you don’t pause rated blitz because a cable wiggled.</p>
+<p>The phone still animates a ticking clock. If Alice disconnects, <strong>the clock still runs</strong>. That is the product: you don’t pause rated blitz because a cable wiggled.</p>
+<p><strong>Pause the clock on disconnect</strong> is a different product (casual, or correspondence).</p>
+<ul>
+<li>Pro: fair if the cable really died.<br>
+<em>Why:</em> they did not choose to stop thinking.</li>
+<li>Con: you can disconnect on purpose with 2 seconds left.<br>
+<em>Why:</em> the pause becomes a cheat. Rated blitz should not offer it. I would not.</li>
+</ul>
 <hr>
 <h2 id="9-serialization-from-the-ground-up">9. Serialization, from the ground up</h2>
 <p>This is the word that sounds like “turn a struct into JSON.” That is not what we mean here.</p>
@@ -231,42 +353,110 @@ Not the move. Not the clock check. Matchmaking under a few seconds is the other 
 <h3 id="four-ways-to-get-that-conveyor">Four ways to get that conveyor</h3>
 <p><strong>1. A distributed lock (Redis <code>SETNX</code> per game).</strong><br>
 Any game server can handle a move, but it must grab <code>lock:game:123</code> first, apply, release.</p>
-<p>Easy to draw. Fragile in production: the lock expires while you are still thinking, or you crash holding it, or two servers both think they won the lock after a network split. You also still have to <strong>route the WebSocket</strong> — after the lock, which process broadcasts? Two servers can both believe they are authoritative.</p>
+<ul>
+<li>Pro: any replica can serve any game. The load balancer stays dumb.<br>
+<em>Why:</em> ownership is the lock, not the routing table. Easy to draw in two minutes.</li>
+<li>Pro: you serialize applies while the lock is held.<br>
+<em>Why:</em> the second process blocks or fails <code>SETNX</code> instead of forking the FEN.</li>
+<li>Con: the lock has a TTL. If apply is slower than TTL, two holders exist.<br>
+<em>Why:</em> network blips and GC pauses are real. A 3s lock and a 4s engine call = two writers.</li>
+<li>Con: crash-while-holding, or a split brain after a partition, leaves a stuck or double lock.<br>
+<em>Why:</em> distributed locks are lease + hope unless you add fencing (and then you built option 4 with extra steps).</li>
+<li>Con: the lock does not tell you <strong>which process should broadcast</strong> on the WebSocket.<br>
+<em>Why:</em> two servers can both think they won, apply in order, then both push. Clients see duplicates or flaps.</li>
+</ul>
 <p>Fine for a prototype. I would not make it the only ordering mechanism at 80,000 live games.</p>
 <p><strong>2. Let the database serialize (compare-and-swap).</strong><br>
-Any server tries. The update is:</p>
+Any server tries:</p>
 <pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>UPDATE games</span></span>
 <span class="line"><span>SET move_count = 18, current_fen = $new, version = version + 1</span></span>
 <span class="line"><span>WHERE id = $game AND move_count = 17 AND version = $v</span></span></code></pre>
-<p>If zero rows, someone else already took move 17. Retry or tell the client to sync.</p>
-<p>Deterministic. No special routing. At this scale the <strong>database becomes the conveyor for every hot game</strong>, and we are latency-sensitive. Use CAS as a <strong>guardrail</strong> (a second line of defense). Do not make Postgres the thing that orders 10,000 moves/sec by itself.</p>
-<p><strong>3. A queue partitioned by <code>game_id</code> (Kafka, etc.).</strong><br>
-All moves for game 123 land on the same partition. One consumer processes them in order. Durability for in-flight moves is nice.</p>
-<p>Extra hop: enqueue, then dequeue, then apply. That hop fights the 150ms budget. Heavy for “two people, one board.” I would use a log for <strong>analytics</strong> or <strong>archiving</strong>, not for the tap on e2e4.</p>
-<p><strong>4. One writer process per game (shard / actor) — this is the one I’d take.</strong><br>
-Hash the <code>game_id</code>. Game 123 always goes to <strong>game-service shard 7</strong>. Inside that process, one in-memory actor (or a single-threaded loop) applies moves <strong>sequentially</strong>. The WebSocket gateway uses the <strong>same hash</strong> so both players’ sockets talk to the shard that owns the board.</p>
+<p>Zero rows means someone else already took move 17.</p>
 <ul>
-<li>One game → one order → one writer.</li>
-<li>Postgres stores the append-only moves (durability) and can still CAS as a backstop.</li>
-<li>Broadcast is obvious: the owner already has both connections, or publishes to a channel the gateways subscribe to.</li>
-<li>Scale out: more shards, more games. A game is tiny; 80,000 actors is normal.</li>
+<li>Pro: the order is whatever Postgres committed. No special routing.<br>
+<em>Why:</em> isolation + <code>WHERE version = $v</code> is a single source of “who won the write.”</li>
+<li>Pro: unique <code>(game_id, move_number)</code> is a second backstop.<br>
+<em>Why:</em> even if CAS is forgotten, the insert of <code>MoveEvent</code> 17 twice fails.</li>
+<li>Con: every live move is a round trip to disk on the hot row.<br>
+<em>Why:</em> 10,000/sec of compare-and-swap on contended keys is a serialization engine made of WAL. P99 misses 150ms.</li>
+<li>Con: you still fan out the WebSocket from whoever won the CAS — possibly a different box than the opponent’s socket.<br>
+<em>Why:</em> CAS orders writes, not connections. You still need pub/sub or sticky routing.</li>
 </ul>
-<p>Cost: <strong>deterministic routing</strong> (consistent hashing), and a <strong>failover</strong> when shard 7 dies — another shard must take game 123, load Redis/Postgres, and continue. Ownership transfer is the extra complexity. It is worth it.</p>
+<p>Use CAS as a <strong>guardrail</strong>. Do not make Postgres the only conveyor.</p>
+<p><strong>3. A queue partitioned by <code>game_id</code> (Kafka, etc.).</strong><br>
+All moves for game 123 land on one partition. One consumer applies them in order.</p>
+<ul>
+<li>Pro: the log is durable before you apply. A crash replays the partition.<br>
+<em>Why:</em> that’s what the log is for. In-flight e2e4 is not only in RAM.</li>
+<li>Pro: bursts get absorbed.<br>
+<em>Why:</em> the producer returns once the broker has the message; the consumer can catch up.</li>
+<li>Con: enqueue + dequeue + apply is extra hops.<br>
+<em>Why:</em> each hop is a network + storage wait. The 150ms budget is for the player, not the bus.</li>
+<li>Con: you built a streaming platform for two people and a board.<br>
+<em>Why:</em> operational cost (brokers, consumer groups) is for high fan-out or async work. The move path is neither.</li>
+</ul>
+<p>I would use a log for <strong>analytics</strong> or <strong>archiving</strong>, not for the tap on e2e4.</p>
+<p><strong>4. One writer process per game (shard / actor) — this is the one I’d take.</strong><br>
+Hash the <code>game_id</code>. Game 123 always goes to <strong>game-service shard 7</strong>. Inside that process, one in-memory loop applies moves <strong>sequentially</strong>. The WebSocket gateway uses the <strong>same hash</strong>.</p>
+<ul>
+<li>Pro: one game → one order → one writer, in RAM, no lock TTL.<br>
+<em>Why:</em> a single thread cannot interleave two applies. That is the conveyor.</li>
+<li>Pro: broadcast is local (or one pub to gateways that already hash the same way).<br>
+<em>Why:</em> the owner is the process that just applied. No “who won the lock” argument.</li>
+<li>Pro: more shards, more games. A game is tiny.<br>
+<em>Why:</em> 80,000 actors is 80,000 small state machines, not 80,000 disk rows in a hot loop.</li>
+<li>Con: you need <strong>deterministic routing</strong> (consistent hashing) on every gateway.<br>
+<em>Why:</em> if two gateways hash differently, you have two writers again.</li>
+<li>Con: when shard 7 dies, someone must <strong>take over</strong> game 123, load Redis/Postgres, and continue.<br>
+<em>Why:</em> ownership lived in the process. Failover is the complexity you accepted. Load snapshot + replay tail; do not start a second writer before the first is fenced.</li>
+</ul>
 <p>On that owner, three cheap checks before the engine even runs:</p>
 <ol>
 <li><strong>Serialize</strong> — one queue in memory for that <code>game_id</code>. No parallel apply.</li>
 <li><strong>Dedupe</strong> — same <code>idempotency_key</code> → same response, no second apply.</li>
 <li><strong>Order</strong> — <code>move_number</code> must be next; reject stale or out-of-turn.</li>
 </ol>
-<p>That is “serialization” in this interview: <strong>not JSON</strong>, <strong>one timeline per game</strong>.</p>
+<p>That is “serialization” here: <strong>not JSON</strong>, <strong>one timeline per game</strong>.</p>
 <hr>
 <h2 id="10-phone-and-laptop-at-the-same-time">10. Phone and laptop at the same time</h2>
 <p>Serialization per <em>game</em> is not enough if <strong>one user</strong> has two writers.</p>
 <p>Alice’s laptop still has a socket open. She opens her phone. Both can send e2e4. Move numbers and idempotency keys help, but the UI becomes chaos (“why was my move rejected?”) and the two clocks on the two screens disagree.</p>
 <p>Goal: <strong>at most one writer device per (game_id, user_id).</strong> Other devices may <strong>watch</strong>.</p>
-<p><strong>Allow every device to write</strong>, rely on move numbers. Simplest. Spamy. Unclear who owns the clock UI. Reject.</p>
-<p><strong>Drop the old socket when the new one connects.</strong> Clear ownership. A blip on Wi-Fi then looks like “new device” and you flap: connect, kill, reconnect, kill. Reject as the only mechanism.</p>
-<p><strong>Session lease + fencing token</strong> — this is the one I’d take.</p>
+<p><strong>Allow every device to write; rely on move numbers and idempotency keys.</strong></p>
+<ul>
+<li>Pro: no session model. Phone and laptop both send e2e4; the server keeps one.<br>
+<em>Why:</em> <code>move_number</code> 17 twice is one apply. You already built that for retries.</li>
+<li>Con: both UIs think they are in charge. Rejections look like bugs.<br>
+<em>Why:</em> the laptop sent a legal 17 a millisecond after the phone won. The user sees “invalid move” on one screen.</li>
+<li>Con: two clocks on two screens drift and people claim unfairness.<br>
+<em>Why:</em> both clients animate from different last-sync times. Nobody is the display owner.</li>
+<li>Con: resign / draw / takeback from two devices is a mess even if e2e4 dedupes.<br>
+<em>Why:</em> those are not sequenced like move 17. Two resigns, two draw offers.</li>
+</ul>
+<p><strong>Drop the old socket when a new one connects.</strong></p>
+<ul>
+<li>Pro: exactly one TCP writer. Mental model is “last login wins.”<br>
+<em>Why:</em> you close the laptop socket, so it cannot send.</li>
+<li>Con: a Wi-Fi blip looks like a new device. You flap: connect, kill, reconnect, kill.<br>
+<em>Why:</em> the OS reopened a socket. You treated it as takeover.</li>
+<li>Con: a malicious or accidental second tab kicks the real player.<br>
+<em>Why:</em> there is no epoch. Whoever connects second wins, even for 200ms.</li>
+<li>Con: packets already in flight from the old socket can still arrive after the kill.<br>
+<em>Why:</em> TCP does not vanish instantly. You still need move numbers — so this is not a complete solution.</li>
+</ul>
+<p><strong>Session lease + fencing token (epoch). This is the one I’d take.</strong></p>
+<ul>
+<li>Pro: one writer by contract; everyone else is read-only and still sees the game.<br>
+<em>Why:</em> the laptop can watch. The phone moves. UX matches “I switched devices,” not “I got kicked.”</li>
+<li>Pro: a late packet from the old device cannot win after handover.<br>
+<em>Why:</em> it carries <code>epoch=3</code>. The server now has 4. That number is the fence — like a new hotel keycard, old key dead.</li>
+<li>Pro: retries from the <strong>current</strong> owner still work (same key, same epoch).<br>
+<em>Why:</em> you did not throw away idempotency. You added who is allowed to use it.</li>
+<li>Con: heartbeats, TTL, takeover logic. More state.<br>
+<em>Why:</em> leases expire. You must decide what happens when the phone dies in a tunnel. That is real product work; it is cheaper than unfair clocks.</li>
+<li>Con: a bug that forgets to check epoch is a silent hole.<br>
+<em>Why:</em> every write path (move, resign, draw) must read the lease. Miss one and you are back to two writers.</li>
+</ul>
 <p>For each (game, user) we store a <strong>lease</strong>:</p>
 <ul>
 <li>who owns it (connection id / device id)</li>
@@ -283,7 +473,22 @@ Hash the <code>game_id</code>. Game 123 always goes to <strong>game-service shar
 <p>Postgres: every <code>MoveEvent</code>, the <code>Game</code> row.</p>
 <p>Reconnect: <code>GET /games/{id}</code> (or a socket <code>sync</code>). We send the Redis snapshot. If Redis is empty (shard crashed), load last Postgres snapshot and replay tail moves from <code>MoveEvent</code>.</p>
 <p>The clock did not pause.</p>
-<p>If we <strong>broadcast then crash before persist</strong>, clients saw a move the log does not have. Owner should <strong>persist first, then push</strong>. If we crash after persist, before push, reconnect heals it — the move is in the log.</p>
+<p><strong>Broadcast first, then persist.</strong></p>
+<ul>
+<li>Pro: the opponent’s UI updates as soon as RAM applied the move.<br>
+<em>Why:</em> you skip waiting for Redis/Postgres before the push.</li>
+<li>Con: a crash after the push, before the insert, leaves phones ahead of the log.<br>
+<em>Why:</em> they saw e2e4. Reconnect loads the old FEN. Now you have two truths, and rated clocks already moved on the client.</li>
+<li>Con: “fix it on reconnect” means walking the move back on a live board.<br>
+<em>Why:</em> the other person may have already pre-moved. You cannot un-see a ply in blitz.</li>
+</ul>
+<p><strong>Persist first (Redis snapshot + <code>MoveEvent</code>), then push. This is the one I’d take.</strong></p>
+<ul>
+<li>Pro: anything a client saw is in the log, or they never saw it.<br>
+<em>Why:</em> if we die after persist, before push, reconnect sends the snapshot. The move is not lost; it is just late by one round trip.</li>
+<li>Con: the opponent waits on that write.<br>
+<em>Why:</em> that is milliseconds in Redis, or a short append in Postgres. Still inside 150ms. A forked board is not.</li>
+</ul>
 <p>Version on <code>ClockState</code> / Redis: two applies at once, second CAS fails, client refreshes. Belt and suspenders next to the single writer.</p>
 <hr>
 <h2 id="12-when-this-gets-bigger">12. When this gets bigger</h2>
