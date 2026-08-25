@@ -336,23 +336,23 @@ A common sketch is: cron at midnight, find captured payments, send a batch, mark
 
 Visa will sell you a network report. You still want **Chase's file, Adyen's file, …** — different formats, different cut-offs. The store settled with those banks, not with Visa as a pile of money.
 
-**Authorize is not settlement.** The tap is a fast request/response. Settlement is a file: header, detail lines, trailer with counts and totals. They ack **receipt** ("we got it"). They **process** later. A **result** file comes back. Deposit is later still.
+**Authorize is not settlement.** The tap is a fast request/response. Settlement is almost never a 10,000-request-per-second HTTP API. If it were, you would not pack the day into one upload. What the receiving bank actually gives you is a **file drop** (SFTP, S3, a batch window): header, detail lines, trailer with counts and totals. They ack **receipt** ("we got it"). That ack is not the result. They **process** later, on their clock. A **result** file comes back — that is the asynchronous answer. Deposit is later still.
 
 ### Don't make one 40GB file
 
-If the chain were running at 10,000 taps/sec all day: 10,000 × 86,400 seconds = **864 million** rows. Ten banks, even split: **86.4 million** each — not 86,400, that's the seconds. At 500 bytes a line, ~43 GB per bank.
+If the chain were running at 10,000 taps/sec all day: 10,000 × 86,400 seconds = **864 million** rows. Ten banks, even split: **86.4 million** each — not 86,400. 86,400 is the number of seconds in a day. At 500 bytes a line, ~43 GB per bank.
 
-Uploads are usually capped at hundreds of MB. A 40GB put that dies at 97% starts over. Split on row count: 100,000 rows ≈ 50 MB → hundreds of **part files** per bank per day. Header can still say `batch_id`, `part 17 of 864`.
+Uploads are usually capped at hundreds of MB. A 40GB put that dies at 97% starts over. Split on row count: 100,000 rows ≈ 50 MB → hundreds of **part files** per bank per day. Header can still say `batch_id`, `part 17 of 864`. Same logical batch, many objects.
 
 Receipt ack ≠ result. Don't flip every payment to `settled` just because SFTP succeeded.
 
 ### Don't use a change feed for the cutoff
 
-CDC — every database write becomes an event — is fine for webhooks. It's a bad way to decide "Tuesday's Chase file." Cutoff is a snapshot: `captured_at` before 10pm. Feeds lag; shards lag differently. You double-send or drop a row.
+CDC — every database write becomes an event — is fine for webhooks. It's a bad way to decide "Tuesday's Chase file." Cutoff is a snapshot: `captured_at` before 10pm. After 10pm that set is frozen; a capture at 10:01 belongs to Wednesday. Feeds lag; shards lag differently. You double-send or drop a row.
 
-S3 isn't a log you append line by line. You write a whole object.
+S3 isn't a log you append line by line. You write a whole object. If you try to "stream CDC into S3," you now own local part files, a worker that can die mid-part, and the nasty case **object landed, database write did not**. Then you have an orphan file and the next run doesn't know those rows were already sent.
 
-After 10pm, new taps belong to Wednesday. Read **replicas**, shard by `merchant_id`:
+Direct reads are simpler. Shard by `merchant_id`, read **replicas** so the 10pm scan does not sit on the tap's primary. After cutoff the day's captured rows do not move. Sort by `payment_id` and you always get the same order, so a restart rebuilds the same part.
 
 ```
 WHERE state = 'captured'
@@ -377,18 +377,31 @@ SettlementPart
 Worker, one shard, one bank:
 
 1. Select the next 100k ids from the replica. Empty → done.
-2. Write the file (trailer = count + sum). Crash here: abort the partial upload, rebuild the same key.
-3. **One transaction on the primary:** save the part row; `UPDATE payments SET state = 'settling', batch_part_id = $part WHERE id IN (…) AND state = 'captured'`. The `AND state = 'captured'` stops a double claim.
-4. A separate submitter uploads `uploaded` parts. Crash after S3, before send: submitter retries the same file id.
-5. Receipt → `ack_receipt`. Not `settled` yet.
+2. Write the file locally (trailer = count + sum). Crash here: throw away the local file. Nothing is claimed yet.
+3. Upload to a **deterministic** object key. Crash after S3, before the database: retry the same key (overwrite is fine). You do not invent a second file for the same rows.
+4. **One transaction on the primary:** save the part row (`s3_uri`, `first_payment_id`, `last_payment_id`); `UPDATE payments SET state = 'settling', batch_part_id = $part WHERE id IN (…) AND state = 'captured'`. The `AND state = 'captured'` stops a double claim. If this transaction fails, the object may already exist — next run uses the same key and claims again.
+5. A submitter sends `uploaded` parts to the bank. Crash after send, before we record their receipt: submitter retries the same file id. Their side must treat that file id as idempotent too.
+6. Receipt → `ack_receipt`. Not `settled` yet.
 
 Restart cursor: last committed `last_payment_id`, then `payment_id > that`. Uncommitted work is still `captured` and will be picked again. That's why we sort.
 
 ### Recon: store mismatches, don't UPDATE 86 million rows at once
 
-When the result file lands, most lines match. Keep an **exception** table for the rest (missing on their side, extra on theirs, amount differs). If the trailer matches, mark the **part** done, then move payments to `settled` in chunks of 1,000–10,000 ids on the store's shard, with a cursor. Crash, continue.
+When the result file lands, most lines match. You do **not** need a second copy of every payment. You need an **exception** table for the rest:
 
-Twelve rejected lines: those twelve stay `settling` (or go back to `captured` with a reason). The other 99,988 can settle. Don't block the whole file.
+```
+SettlementException
+  acquirer_id, business_date, part_id
+  payment_id          -- null if they have a line we don't
+  provider_ref
+  kind                missing_theirs | extra_theirs | amount_mismatch | rejected
+  our_cents, their_cents
+  status              open | resolved
+```
+
+If the trailer matches, mark the **part** `result_applied`, then move the matching payments to `settled` in chunks of 1,000–10,000 ids on **that store's shard**, with a cursor. Crash, continue. An 86-million-row `UPDATE` on one machine is a WAL and lock storm, not a shortcut.
+
+Twelve rejected lines: those twelve stay `settling` (or go back to `captured` with a reason) and get exception rows. The other 99,988 can settle. Don't block the whole file.
 
 ---
 
