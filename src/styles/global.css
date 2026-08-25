@@ -442,12 +442,14 @@ del {
 }
 
 .prose p:has(> img),
-.prose p:has(> a > img) {
+.prose p:has(> a > img),
+.prose p:has(> video) {
   text-indent: 0;
   margin: 1.25rem -0.4rem;
 }
 
-.prose img {
+.prose img,
+.prose video {
   display: block;
   width: 100%;
   height: auto;
@@ -457,7 +459,8 @@ del {
 
 @media (min-width: 860px) {
   .prose p:has(> img),
-  .prose p:has(> a > img) {
+  .prose p:has(> a > img),
+  .prose p:has(> video) {
     width: calc(100% + 5.4rem);
     margin-left: -2.7rem;
   }

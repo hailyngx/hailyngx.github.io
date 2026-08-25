@@ -28,6 +28,10 @@ That is how asking the model for a whole `.tex` died. That is how role titles st
 
 Proxmox, Ethernet, a second PC, Kubernetes — later, if I ever have a second product. I cannot un-buy a mini PC I put in the closet. Wi-Fi is fine. A JD and a PDF do not care that the NIC is a Realtek.
 
-The page is `http://haily-homelab:8080` on this machine. Phone uses the LAN IP until I bother renaming `DESKTOP-D29G1M0`. I pointed a friendly name at localhost and called it done. Proof the file path works: I recorded the screen on my phone, uploaded it, downloaded it here. Camera-roll `.jpeg` failed first because Linux treated `C:\fakepath\image.jpeg` as one illegal name. That is a phone bug, not a product.
+The page is `http://haily-homelab:8080` on this machine. Phone uses the LAN IP until I bother renaming `DESKTOP-D29G1M0`. I pointed a friendly name at localhost and called it done. Proof the file path works: I recorded the screen on my phone, uploaded it, downloaded it here.
+
+<video controls playsinline preload="metadata" src="/images/homelab-phone.mp4">Phone screen recording of uploading a file to the box.</video>
+
+Camera-roll `.jpeg` failed first because Linux treated `C:\fakepath\image.jpeg` as one illegal name. That is a phone bug, not a product.
 
 If the page still loads with the monitor unplugged, it's a server. If the PDF still looks like me, it's the product. I would not call this infra in the sense I mean at work. I would call it the smallest thing that made the loop real.
