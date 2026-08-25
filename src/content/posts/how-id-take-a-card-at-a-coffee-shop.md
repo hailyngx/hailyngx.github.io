@@ -12,8 +12,6 @@ Here, someone taps a card for a latte. They might add a tip thirty seconds later
 
 This is the design in the order I'd want to learn it: one latte, the records, the API, then security, exactly-once retries, webhooks, and the 10pm files — the last of those is where this product actually gets hard.
 
-I haven't worked in payments. Ordinary words first, jargon in parentheses.
-
 ---
 
 ## 1. One latte, start to finish
