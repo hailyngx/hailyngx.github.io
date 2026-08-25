@@ -1,0 +1,479 @@
+<!DOCTYPE html><html lang="en"> <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="description" content="A Sora-like pipeline is a task queue on a GPU pool that can vanish. Leases, fencing tokens, checkpoints, and what you do when the box dies at minute nine."><meta name="color-scheme" content="light dark"><title>How I&#39;d schedule a video generation job · haily.yevklnekqt.blog</title><script>
+      (function () {
+        try {
+          var stored = localStorage.getItem("theme");
+          var theme =
+            stored === "day" || stored === "night"
+              ? stored
+              : window.matchMedia("(prefers-color-scheme: dark)").matches
+                ? "night"
+                : "day";
+          document.documentElement.setAttribute("data-theme", theme);
+        } catch (e) {
+          document.documentElement.setAttribute("data-theme", "day");
+        }
+      })();
+    </script><link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/dreampulse/computer-modern-web-font@master/fonts.css"><link rel="stylesheet" href="/_astro/about.C8w7oBXg.css"></head> <body> <div class="wrap"> <header class="site-header"> <div class="wordmark-lockup">  <a class="wordmark" href="/">haily nguyen</a> </div> <div class="header-tools"> <nav class="nav" aria-label="Primary"> <a href="/">Notes</a> <a href="/about">About</a> </nav> <button class="theme-toggle" type="button" data-theme-toggle>
+🌙
+</button> </div> </header>  <article> <header class="article-header"> <h1>How I&#39;d schedule a video generation job</h1> <p class="post-meta">August 25, 2026</p> </header> <div class="prose"> <p>A text-to-video API looks like a prompt and an MP4. The product is: take the job, put it on a GPU, survive the GPU disappearing, and never run the same video twice.</p>
+<p>Generation takes minutes. The public request cannot sit open until the file exists. The pool is not a web fleet — one worker, one video, and the machine may be a spot instance that dies with a two-minute warning or with none. Prompt safety, billing, and moderation sit upstream. This note is the scheduler, the worker, and every way that pair fails.</p>
+<p>This is the order I’d teach it. One job so the words mean something. Then the records — a job is not an attempt — the API, and why we persist before we say 202. After that: which queue, pull vs push, the lease and the fencing token, checkpoints, cancel, and what we do when there are no GPUs left. Last, the failure cases one by one. That last section is the design.</p>
+<hr>
+<h2 id="1-one-video-start-to-finish">1. One video, start to finish</h2>
+<p>Alice wants ten seconds, 720p, model <code>sora-v1</code>. “Drone shot over a snowy mountain at sunrise.”</p>
+<ol>
+<li>She <code>POST</code>s. We write a <code>GenerationJob</code> (<code>queued</code>) in Postgres, in the same transaction as an outbox row. We return <strong>202</strong> with <code>job_id</code> and an ETA. We do not wait for a GPU.</li>
+<li>A worker that is idle and already has <code>sora-v1</code> in VRAM <strong>pulls</strong>. We claim the job in Postgres, create a <code>JobAttempt</code> with a <strong>fencing token</strong> and a 30-second lease, mark the worker busy. At most one active video on that box.</li>
+<li>The worker loads the prompt blob, generates, and every ~5 seconds writes progress. Every ~10 seconds it heartbeats and extends the lease. Every ~30 seconds it uploads a <strong>checkpoint</strong> to object storage and stores the ref on the attempt.</li>
+<li>It uploads the MP4, calls complete with the same fencing token. The job becomes <code>completed</code>. Alice gets a signed URL. We delete old checkpoints.</li>
+</ol>
+<p>If the box dies at minute two, the lease expires. A new worker takes <strong>attempt 2</strong>, loads the latest checkpoint, continues. Alice still has one <code>job_id</code>. <code>attempt_no: 2</code> is how she can tell we recovered.</p>
+<p>If you remember only the sequence: <strong>durable job → worker pulls → fenced attempt → checkpoint often → complete once.</strong></p>
+<hr>
+<h2 id="2-what-to-build">2. What to build</h2>
+<p>Lock the product or you design a model-serving paper.</p>
+<p>I’d include:</p>
+<ul>
+<li>Submit prompt + model version + duration + output settings; get a <code>job_id</code> in well under 500ms</li>
+<li>Poll (or SSE / webhook) for status, progress, and a download URL</li>
+<li>Cancel queued or running work</li>
+<li>Assign each queued job to an idle GPU; <strong>one active video per worker</strong></li>
+<li>Survive worker death, provider death, and a blip on the network without losing a job we already accepted</li>
+</ul>
+<p>I’d leave out unless asked: the diffusion math, prompt safety, billing, a public gallery, multi-GPU for one video. Friendlier ETA math can wait; a honest “queue is 12 minutes” cannot.</p>
+<p>Four questions hide most of the rest:</p>
+<p><strong>Who is the job?</strong><br>
+The row in <em>our</em> database. Not a message in the provider’s queue, not a Redis key, not “the VM is still up.” If the cloud loses the instance, we still have to know Alice is owed a video.</p>
+<p><strong>What is an attempt?</strong><br>
+One run on one worker. Preemption starts a new attempt of the <em>same</em> job. That split is how retry stays clean.</p>
+<p><strong>When is the GPU ours?</strong><br>
+Only while a lease is live and the worker still holds the current fencing token. A box that missed heartbeats is not ours, even if it later phones home with an MP4.</p>
+<p><strong>What can be slow?</strong><br>
+The render. Not the 202. Not cancel. Not “show me 62%.” Queue <em>wait</em> may blow past 30 seconds when the pool is empty — that is capacity, not a scheduler bug. We show an ETA and we <strong>admit</strong> only what we will actually run. We do not pretend the fleet is infinite.</p>
+<p>I’d write numbers on the board:</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Goal</th><th>Target</th><th>Why</th></tr></thead><tbody><tr><td>Ack (P95)</td><td>under 500ms</td><td>Control plane. She is not waiting on CUDA.</td></tr><tr><td>Start when capacity exists (P95)</td><td>under 30s</td><td>“Queued” should become “running”</td></tr><tr><td>Progress freshness</td><td>under 5s</td><td>The bar has to move</td></tr><tr><td>Accepted-job durability</td><td>no lost jobs</td><td>202 means we wrote the row</td></tr><tr><td>Work lost on preemption</td><td>under 30s</td><td>Checkpoint bound</td></tr><tr><td>Availability (submit)</td><td>99.9%</td><td>The queue can be long; the POST cannot be down</td></tr></tbody></table>
+<p>100K videos/day. Peak <strong>20 jobs/sec</strong>. Average <strong>3 minutes</strong> on one GPU. 20 × 180s = <strong>3,600</strong> running at peak. I’d keep ~4,000 workers (about a 10% idle buffer) so a blip in scale-up does not empty the ready pool.</p>
+<p>Control plane is small: ~20 job writes/sec, ~360 heartbeats/sec, ~720 progress events/sec. Final artifacts: 100K × 25 MB = <strong>2.5 TB/day</strong>. Checkpoints can exceed that if you keep a museum. Keep the latest one or two, aggressive TTL.</p>
+<p>GPU capacity, cold starts, and lost work dominate. The metadata database is not the bottleneck.</p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>  Client                         Control plane                    GPU pool</span></span>
+<span class="line"><span>    |                                  |                              |</span></span>
+<span class="line"><span>    |  POST /video-generations         |                              |</span></span>
+<span class="line"><span>    |  (idempotency key)               |                              |</span></span>
+<span class="line"><span>    +--------------------------------->|  write job + outbox          |</span></span>
+<span class="line"><span>    |  202  job_id, ETA                |  Postgres                    |</span></span>
+<span class="line"><span>    |&#x3C;---------------------------------+                              |</span></span>
+<span class="line"><span>    |                                  |  ready hint (Redis / SQS)    |</span></span>
+<span class="line"><span>    |                                  |                              |</span></span>
+<span class="line"><span>    |                                  |     pull / lease             |</span></span>
+<span class="line"><span>    |                                  |&#x3C;-----------------------------+</span></span>
+<span class="line"><span>    |                                  |  claim in Postgres           |</span></span>
+<span class="line"><span>    |                                  |  fencing_token + 30s lease   |</span></span>
+<span class="line"><span>    |                                  +----------------------------->|</span></span>
+<span class="line"><span>    |                                  |     heartbeat 10s            |</span></span>
+<span class="line"><span>    |                                  |     progress 5s              |</span></span>
+<span class="line"><span>    |                                  |     checkpoint ~30s → S3     |</span></span>
+<span class="line"><span>    |  GET status / SSE / webhook      |     complete → MP4 in S3     |</span></span>
+<span class="line"><span>    |&#x3C;---------------------------------+&#x3C;-----------------------------+</span></span></code></pre>
+<hr>
+<h2 id="3-two-records-the-video-and-each-run">3. Two records: the video, and each run</h2>
+<p>The first data-model mistake is one row with <code>status</code> and <code>worker_id</code>. It looks clean. Then the worker dies, you retry, and you can no longer tell “we ran this twice” from “the old box is still uploading.” Disputes and refunds of GPU time need that history.</p>
+<p>A <strong>GenerationJob</strong> is the intent: Alice wants this prompt, this model, this length. One row. Status: <code>queued</code>, <code>assigned</code>, <code>running</code>, <code>completing</code>, <code>completed</code>, <code>failed</code>, <code>cancelled</code>.</p>
+<p>A <strong>JobAttempt</strong> is one try on one worker: lease, fencing token, checkpoint ref, how it ended (<code>leased</code>, <code>running</code>, <code>lost</code>, <code>failed</code>, <code>succeeded</code>).</p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>GenerationJob</span></span>
+<span class="line"><span>  id, user_id, idempotency_key</span></span>
+<span class="line"><span>  prompt_ref              -- blob in object storage, not a 10k-char column</span></span>
+<span class="line"><span>  model_version, duration_sec, resolution</span></span>
+<span class="line"><span>  priority_tier           -- free | pro | enterprise</span></span>
+<span class="line"><span>  status, progress_pct</span></span>
+<span class="line"><span>  latest_checkpoint_ref</span></span>
+<span class="line"><span>  final_artifact_id</span></span>
+<span class="line"><span>  failure_reason</span></span>
+<span class="line"><span>  created_at, started_at, completed_at</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>JobAttempt</span></span>
+<span class="line"><span>  id, job_id, attempt_no</span></span>
+<span class="line"><span>  worker_id, provider_instance_id</span></span>
+<span class="line"><span>  fencing_token</span></span>
+<span class="line"><span>  status</span></span>
+<span class="line"><span>  last_heartbeat_at, lease_expires_at</span></span>
+<span class="line"><span>  checkpoint_ref, failure_reason</span></span>
+<span class="line"><span>  started_at, ended_at</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>Worker</span></span>
+<span class="line"><span>  id, provider, provider_instance_id</span></span>
+<span class="line"><span>  gpu_type, region</span></span>
+<span class="line"><span>  status                  -- booting | idle | busy | draining | lost | terminated</span></span>
+<span class="line"><span>  current_job_id</span></span>
+<span class="line"><span>  last_heartbeat_at, drain_deadline</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>Artifact</span></span>
+<span class="line"><span>  id, job_id</span></span>
+<span class="line"><span>  type                    -- input | checkpoint | final_video</span></span>
+<span class="line"><span>  object_key, size_bytes, checksum</span></span>
+<span class="line"><span>  expires_at</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>JobEvent</span></span>
+<span class="line"><span>  id, job_id, attempt_id</span></span>
+<span class="line"><span>  type                    -- queued | leased | progress | checkpointed | ...</span></span>
+<span class="line"><span>  payload</span></span>
+<span class="line"><span>  created_at</span></span></code></pre>
+<p>User 1:N jobs. Job 1:N attempts, artifacts, events. Worker 1:N attempts.</p>
+<p>These rows live in <strong>Postgres</strong>. Same reasons as any other money-shaped state: one transaction for “this job is assigned, this attempt exists, this worker is busy”; a unique <code>(user_id, idempotency_key)</code> so a retry of the POST is the same video; a check that <code>queued → completed</code> cannot skip the middle.</p>
+<p><strong>One <code>jobs</code> row that is also the attempt.</strong></p>
+<ul>
+<li>Pro: fewer tables. One <code>UPDATE</code> to mark running.<br>
+<em>Why:</em> a prototype fits in a screenshot.</li>
+<li>Con: retry overwrites the only history of the first run.<br>
+<em>Why:</em> you cannot answer “did worker A still finish after we started worker B?” without an audit log you then have to invent.</li>
+<li>Con: fencing, lease expiry, and “current attempt” become flags on the same row and fight.<br>
+<em>Why:</em> two writers, one noun. Split the noun.</li>
+</ul>
+<p><strong>Job + Attempt. This is the one I’d take.</strong></p>
+<hr>
+<h2 id="4-the-api">4. The API</h2>
+<p>Generation is minutes. HTTP is request/response. So the public API is async.</p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>POST   /api/video-generations                 → 202 + job_id</span></span>
+<span class="line"><span>GET    /api/video-generations/{job_id}</span></span>
+<span class="line"><span>DELETE /api/video-generations/{job_id}        cancel</span></span>
+<span class="line"><span>GET    /api/video-generations/{job_id}/events</span></span></code></pre>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="json"><code><span class="line"><span style="color:#E1E4E8">POST /api/video-generations</span></span>
+<span class="line"><span style="color:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#79B8FF">  "prompt"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"drone shot over a snowy mountain at sunrise"</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">  "model_version"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"sora-v1"</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">  "duration_sec"</span><span style="color:#E1E4E8">: </span><span style="color:#79B8FF">10</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">  "resolution"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"720p"</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">  "callback_url"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"https://…"</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">  "idempotency_key"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"req_7cfa9c1a"</span></span>
+<span class="line"><span style="color:#E1E4E8">}</span></span>
+<span class="line"></span>
+<span class="line"><span style="color:#E1E4E8">→ </span><span style="color:#79B8FF">202</span></span>
+<span class="line"><span style="color:#E1E4E8">{</span></span>
+<span class="line"><span style="color:#79B8FF">  "job_id"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"job_123"</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">  "status"</span><span style="color:#E1E4E8">: </span><span style="color:#9ECBFF">"queued"</span><span style="color:#E1E4E8">,</span></span>
+<span class="line"><span style="color:#79B8FF">  "estimated_wait_seconds"</span><span style="color:#E1E4E8">: </span><span style="color:#79B8FF">45</span></span>
+<span class="line"><span style="color:#E1E4E8">}</span></span></code></pre>
+<p>Same idempotency key → same <code>job_id</code>. A new key is a new video, on purpose.</p>
+<p>GET includes <code>status</code>, <code>progress_pct</code>, <code>attempt_no</code>, <code>result_url</code>, <code>failure_reason</code>. <code>attempt_no</code> moving from 1 to 2 while the id stays <code>job_123</code> is preemption you can see.</p>
+<p><strong>Block until the MP4 exists.</strong></p>
+<ul>
+<li>Pro: one call, one file. Simple client.<br>
+<em>Why:</em> that is how a 50ms image resize API feels.</li>
+<li>Con: minutes of GPU on a load-balancer timeout.<br>
+<em>Why:</em> idle TCP is not a job record. A retry looks like a second video if you have not already persisted.</li>
+</ul>
+<p><strong>202 + durable <code>job_id</code>. This is the one I’d take.</strong></p>
+<p>Workers are not the public internet. Internal, typed:</p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>POST /internal/workers/register</span></span>
+<span class="line"><span>POST /internal/workers/{id}/lease</span></span>
+<span class="line"><span>POST /internal/attempts/{id}/heartbeat</span></span>
+<span class="line"><span>POST /internal/attempts/{id}/progress</span></span>
+<span class="line"><span>POST /internal/attempts/{id}/checkpoint</span></span>
+<span class="line"><span>POST /internal/attempts/{id}/complete</span></span>
+<span class="line"><span>POST /internal/attempts/{id}/fail</span></span></code></pre>
+<p>Every heartbeat, progress, checkpoint, complete, and fail carries the <strong>fencing token</strong> from assignment. A write with the wrong token is a no-op. That is the whole split-brain defense.</p>
+<p>Progress to Alice: she can poll GET. SSE is nicer for a tab. Webhooks for her backend. The GPU path does not wait on her server — same outbox idea as a receipt that must print before inventory is told.</p>
+<hr>
+<h2 id="5-the-queue-is-a-hint">5. The queue is a hint</h2>
+<p>A common sketch is: push the job into Redis (or SQS, or Kafka), workers pop, done. That is a prototype. The bug is treating the broker as the job.</p>
+<p>If Redis restarts, Alice’s 202 is a lie unless the row is in Postgres. If SQS delivers twice, two GPUs render unless the claim is in Postgres. If we <code>ZPOPMIN</code> and then crash before <code>UPDATE jobs</code>, the message is gone and the row is still <code>queued</code> — or the opposite.</p>
+<p><strong>Authoritative transition <code>queued → assigned</code> happens in Postgres.</strong> Redis (or SQS) is a <strong>ready index</strong>: “there is something this GPU type can run.” Stale hints are fine. Double assignment is not.</p>
+<p>The API writes the job <strong>and</strong> an outbox/ready event in one transaction. A dispatcher fills Redis. A Redis miss must not lose an accepted job. A sweeper can <code>SELECT … WHERE status = 'queued' AND id NOT IN (hint)</code> and repair the index.</p>
+<h3 id="which-broker">Which broker</h3>
+<p><strong>Postgres <code>FOR UPDATE SKIP LOCKED</code> as the only queue.</strong></p>
+<ul>
+<li>Pro: one system. The claim <em>is</em> the row lock. Crash-safe.<br>
+<em>Why:</em> 20 inserts/sec is nothing. You already need this <code>UPDATE</code> for correctness.</li>
+<li>Con: every idle worker polls the primary.<br>
+<em>Why:</em> 4,000 workers × a tight loop is a connection and lock storm. PgBouncer helps; a hot <code>queued</code> index still sits on the control plane you wanted quiet.</li>
+<li>Con: priority + model + GPU type is several indexes or one messy <code>ORDER BY</code>.<br>
+<em>Why:</em> you will partition anyway. Might as well put the <em>index</em> in Redis and keep the <em>claim</em> here.</li>
+</ul>
+<p><strong>Redis sorted set (priority + time). This is the ready index I’d take</strong>, in front of the Postgres claim.</p>
+<ul>
+<li>Pro: <code>ZPOPMIN</code> (or a peek) is cheap. Paid jobs can have a lower score than free.<br>
+<em>Why:</em> score ≈ <code>priority_bucket + timestamp</code>. Cross-partition priority is what Kafka does not give you for free.</li>
+<li>Pro: partition keys: <code>ready:{tier}:{model}:{gpu_type}</code>. A 720p worker does not walk enterprise 4K.<br>
+<em>Why:</em> one giant FIFO lets a mismatched job block a compatible GPU.</li>
+<li>Con: Redis is not durable in the way a 202 needs.<br>
+<em>Why:</em> AOF/replication still is not the job. Rebuild from Postgres. Treat pop as a hint, then <code>UPDATE … WHERE status = 'queued'</code>.</li>
+</ul>
+<p><strong>SQS (or any cloud queue with a visibility timeout).</strong></p>
+<ul>
+<li>Pro: you do not run Redis. At-least-once is explicit. Visibility timeout <em>is</em> a lease. Dead-letter after N receives.<br>
+<em>Why:</em> ops likes a managed box. The timeout maps to “if the worker did not delete the message, give it to someone else.”</li>
+<li>Con: no real priority. Standard SQS does not FIFO your paid user ahead of 10,000 free jobs. FIFO SQS has throughput caps and still is not “pro jumps the line.”<br>
+<em>Why:</em> priority is a product requirement. You would still filter in Postgres or run several queues (which is partitioning by another name).</li>
+<li>Con: at-least-once means two workers can see the same <code>job_id</code>.<br>
+<em>Why:</em> that is fine <strong>if</strong> only one <code>UPDATE</code> wins. SQS is the wake-up; Postgres is the mutex. Delete the message after a successful claim, extend visibility on heartbeat — or you will get a second delivery while the first GPU is still rendering.</li>
+<li>Con: long-poll and redrive do not replace <code>JobAttempt</code>.<br>
+<em>Why:</em> SQS has no checkpoint_ref. The provider losing a message cannot be “the job is gone.”</li>
+</ul>
+<p>If someone asks “why SQS?”: I would use it as the <strong>dispatcher</strong> (outbox → SQS → worker wakes → claim in Postgres), not as the system of record. Visibility timeout ~30s, heartbeat extends it, complete deletes the message. Same fencing token as in the Redis design. I would not skip Postgres because SQS is durable.</p>
+<p><strong>Kafka.</strong></p>
+<ul>
+<li>Pro: the log is the history of “please run this.” Replay after a poison consumer.<br>
+<em>Why:</em> that is what a log is for.</li>
+<li>Con: partitions do not give you global priority. A consumer group is extra hops on a path that is already “find an idle GPU.”<br>
+<em>Why:</em> 20 messages/sec is not a streaming problem. Kafka shines when you fan out to many independent consumers. Here one job must run on <strong>one</strong> GPU. I would use a log for analytics / JobEvent, not for the claim.</li>
+</ul>
+<p><strong>If Redis and Postgres disagree, Postgres wins.</strong> A stale ready hint is a wasted <code>SELECT</code>. A stale pop that cannot claim is a no-op.</p>
+<hr>
+<h2 id="6-pull-vs-push">6. Pull vs push</h2>
+<p><strong>Push: scheduler picks an idle worker and assigns.</strong></p>
+<ul>
+<li>Pro: the job can start as soon as you know a GPU is free. No extra round trip from the worker.<br>
+<em>Why:</em> you have a map of idle ids. Dispatch is one RPC.</li>
+<li>Con: the map lies. The worker you pushed to has already died, or is mid-OOM, or never finished booting.<br>
+<em>Why:</em> volatile pools. You just wasted a dispatch and maybe a cold start on a corpse.</li>
+<li>Con: “one video per worker” is a rule you must enforce in the pusher. Two schedulers both see idle.<br>
+<em>Why:</em> you reinvent a claim on the worker row — which pull already is.</li>
+</ul>
+<p><strong>Pull: idle worker asks for one job. This is the one I’d take.</strong></p>
+<ul>
+<li>Pro: only currently-alive workers get work.<br>
+<em>Why:</em> a dead box does not poll. Assignment is “this process is here.”</li>
+<li>Pro: a worker that just finished booting pulls immediately.<br>
+<em>Why:</em> cold start already cost 30–90s to load weights. Do not add “wait until the scheduler notices me.”</li>
+<li>Pro: one outstanding lease per worker is natural: do not poll until complete or drain.<br>
+<em>Why:</em> that is the product constraint, not a lock you forget.</li>
+<li>Con: an idle worker polls. Empty pool → sleep with jitter.<br>
+<em>Why:</em> 4,000 workers at 1 Hz is 4,000 RPCs/sec. Batch or long-poll the lease endpoint; do not <code>SELECT</code> Postgres on each tick — use the Redis hint first.</li>
+</ul>
+<p><strong>Hybrid (push into hot, already-warm pools).</strong></p>
+<ul>
+<li>Pro: you skip the poll on a pool that is always hungry.<br>
+<em>Why:</em> lower scheduling latency when you trust liveness.</li>
+<li>Con: two paths.<br>
+<em>Why:</em> the cold/spot path still needs pull. I would not start here.</li>
+</ul>
+<hr>
+<h2 id="7-the-claim-and-the-token">7. The claim, and the token</h2>
+<p>Invariant: <strong>one logical job has at most one valid active attempt.</strong></p>
+<pre class="astro-code github-dark" style="background-color:#24292e;color:#e1e4e8; overflow-x: auto;" tabindex="0" data-language="plaintext"><code><span class="line"><span>assign(worker):</span></span>
+<span class="line"><span>  ids = peekReady(worker.model, worker.gpu)   # Redis/SQS: hint only</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>  BEGIN</span></span>
+<span class="line"><span>    job = UPDATE generation_jobs</span></span>
+<span class="line"><span>          SET status = 'assigned'</span></span>
+<span class="line"><span>          WHERE id IN (ids) AND status = 'queued'</span></span>
+<span class="line"><span>          RETURNING *                         # skip locked / first win</span></span>
+<span class="line"><span>    if no row: ROLLBACK; return none</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>    attempt = INSERT job_attempts (</span></span>
+<span class="line"><span>      job_id, worker_id,</span></span>
+<span class="line"><span>      fencing_token,          -- new UUID</span></span>
+<span class="line"><span>      lease_expires_at        -- now + 30s</span></span>
+<span class="line"><span>    )</span></span>
+<span class="line"><span>    UPDATE workers SET status = 'busy', current_job_id = job.id</span></span>
+<span class="line"><span>  COMMIT</span></span>
+<span class="line"><span></span></span>
+<span class="line"><span>  deleteReadyHint(job.id)    # best-effort</span></span>
+<span class="line"><span>  return attempt</span></span></code></pre>
+<p>Prefer a job that already has <code>latest_checkpoint_ref</code> on a worker with the same <code>model_version</code> — resume beats start-from-zero.</p>
+<p><strong>Distributed lock in Redis, then run.</strong></p>
+<ul>
+<li>Pro: fast. Familiar.<br>
+<em>Why:</em> <code>SETNX job:123</code>.</li>
+<li>Con: lock TTL vs a 3-minute render. Two holders if GC pauses past TTL.<br>
+<em>Why:</em> we already lived this on chess. The job row is the lock.</li>
+</ul>
+<p><strong>Compare-and-swap in Postgres. This is the one I’d take</strong> (after the hint).</p>
+<p>Lease: 30s. Heartbeat every 10s extends it. Three missed beats → lost. Progress can be more frequent than the heartbeat; it does not <em>replace</em> the heartbeat.</p>
+<p><strong>Fencing token.</strong> When we create attempt 2, we mint a new UUID. Attempt 1’s complete is rejected even if the old VM’s network comes back. Think of a hotel keycard. New guest, new key. Old key does not open the door.</p>
+<p><code>complete</code> / <code>fail</code> are idempotent on <code>(attempt_id, fencing_token)</code>. A redelivered success is the same MP4, not a second job.</p>
+<hr>
+<h2 id="8-what-the-worker-actually-does">8. What the worker actually does</h2>
+<ol>
+<li>Boot, register (<code>booting</code> → <code>idle</code>). Load the model if this pool is dedicated to <code>sora-v1</code>.</li>
+<li><code>lease</code> — pull one job.</li>
+<li>If <code>checkpoint_ref</code> is set, restore; else start at step 0.</li>
+<li>Loop: denoise / generate, every 5s progress, every 10s heartbeat, every ~30s checkpoint.</li>
+<li>Encode MP4, upload, <code>complete</code>.</li>
+<li>If the provider says draining: stop pulling, finish or checkpoint, status <code>draining</code>.</li>
+</ol>
+<p><strong>One video per worker.</strong></p>
+<ul>
+<li>Pro: VRAM and the runtime are a bad roommate. Latency and checkpoint times stay predictable. Failure is one job, not two.<br>
+<em>Why:</em> a diffusion model is not a 5ms HTTP handler. Two videos on one GPU steal each other’s memory bandwidth and make ”30s checkpoint” a lie.</li>
+<li>Con: utilization looks “low” if you think like a CPU packer.<br>
+<em>Why:</em> the constraint is VRAM and isolation, not idle CUDA cores between steps. If they ask about packing: smaller models, MIG slices, or a cheap tier — not two Sora jobs on one H100 in v1.</li>
+</ul>
+<p><strong>Model warmth.</strong> A cold worker downloads weights and loads VRAM: 30–90s. Route the next <code>sora-v1</code> job to a box that already has it. If none is idle, any compatible GPU is better than waiting for a specialist that does not exist. Keep a small <strong>warm idle buffer</strong> (that 10%) so a spike does not pay cold start on every job.</p>
+<p>Provider <strong>drain / preemption notice</strong>: mark <code>draining</code>, no new leases, checkpoint now, release. <strong>No notice</strong> (kernel panic, some clouds): the only signal is a missed heartbeat. Do not design as if SIGTERM always arrives.</p>
+<p>Keep the system of record in our database. Do not “hand the job to the GPU vendor’s queue” and assume it is safe.</p>
+<hr>
+<h2 id="9-checkpoints">9. Checkpoints</h2>
+<p>Without them, a death at minute 2.5 of 3 wastes almost a full GPU-video. The budget is <strong>under 30 seconds of lost work</strong>, so we checkpoint on that order — every 20–30s, or at a milestone if the model has one, whichever comes first.</p>
+<p>Upload resume state to object storage. Object PUT is atomic: the new file is there or it isn’t. Keep <strong>the previous</strong> checkpoint until the new one’s checksum is on the attempt row. Restore fails → try the previous; none valid → start over.</p>
+<p>Keep only the latest 1–2 per active job. Delete after success or terminal failure. TTL the rest. Prefix the keys (<code>s3://ckpt/{job_id[0:2]}/{job_id}/attempt-N/…</code>) so a fleet-wide reclaim does not hammer one S3 prefix.</p>
+<p><strong>Checkpoint every few seconds.</strong></p>
+<ul>
+<li>Pro: almost no rework.<br>
+<em>Why:</em> the bound is the interval.</li>
+<li>Con: serialize + upload steals GPU/CPU/network from generation. Checkpoint volume exceeds the MP4s.<br>
+<em>Why:</em> a multi-GB latent dump every 5s at 3,600 concurrent jobs is a storage and bandwidth product, not a footnote.</li>
+</ul>
+<p><strong>Checkpoint every few minutes.</strong></p>
+<ul>
+<li>Pro: cheap.<br>
+<em>Why:</em> few PUTs.</li>
+<li>Con: you miss the 30s lost-work budget.<br>
+<em>Why:</em> a preemption at t=2:50 with a 3-minute cadence can replay almost the whole job.</li>
+</ul>
+<p><strong>Fixed ~30s. This is the one I’d take first.</strong> Then talk about adapting: longer jobs, flakier providers, deeper queues → more often; stable on-demand pools → less often. Fixed is debuggable. Adaptive is a second pass.</p>
+<p>On SIGTERM: one emergency checkpoint, then stop. Do not spend the whole notice window on a second encode of the MP4 “in case.”</p>
+<hr>
+<h2 id="10-cancel">10. Cancel</h2>
+<p>Queued: mark <code>cancelled</code>, drop the ready hint. The next claim sees a non-<code>queued</code> row and skips.</p>
+<p>Running: set <code>cancel_requested</code> on the job. Next heartbeat the worker sees it, checkpoints if that is cheap, stops, <code>fail</code> with reason <code>cancelled</code>. Late <code>complete</code> from a stale attempt: fencing token + terminal state → reject. We do not publish that MP4 as Alice’s video.</p>
+<p>Do not wait for the GPU to ACK before the DELETE returns. She asked to stop. The row says cancelled. The worker is eventually consistent; the token makes a late success harmless.</p>
+<hr>
+<h2 id="11-no-gpus-left">11. No GPUs left</h2>
+<p>20 jobs/sec × 3 minutes is 3,600 running <strong>if</strong> you have 3,600 GPUs. If you have 400, the other jobs wait. Pretending otherwise is how you blow the scheduling SLA and then lie on the ETA.</p>
+<p><strong>Admission queue</strong> (cheap, can be huge) vs <strong>running set</strong> (capped by the pool). Separate them. The running set is <code>assigned</code> / <code>running</code>. The rest stay <code>queued</code> with a position and <code>estimated_wait_seconds</code>.</p>
+<p>ETA ≈ (queued compatible jobs × avg duration) / workers in that pool. Show it. When wait exceeds a tier’s max, <strong>reject</strong> (429 / 503 with retry-after) or degrade (lower resolution) — product call. Free tier hits the cap first. Enterprise may have a reserved on-demand slice.</p>
+<p><strong>Fair-share:</strong> a free user with 10,000 queued prompts should not freeze a paying customer’s one job. Priority at <em>admission and dequeue</em>, not by killing a running video every time someone richer arrives. Preempt a running free job only if you checkpoint and the policy says so; pair with a cooldown or you thrash.</p>
+<p><strong>Autoscaler (capacity manager):</strong> watch queue depth, wait time, idle buffer. Call the provider to add workers. New VMs are <strong>cold</strong>. Do not count them as capacity until they register idle. Scale down: drain, no new leases, then terminate.</p>
+<p><strong>10× spike, fleet size N.</strong> Queue grows. Priority + fair-share + honest ETA. Scale out as fast as the cloud sells GPUs. Do not drop accepted jobs. Stop <em>accepting</em> if the wait is unbounded and the product allows it.</p>
+<hr>
+<h2 id="12-failure-cases">12. Failure cases</h2>
+<p>This is the section I would spend the time on.</p>
+<p><strong>Spot / provider drain, with warning.</strong><br>
+Detect: metadata / SIGTERM / “this instance is draining.”<br>
+Do: worker <code>draining</code>, no new pull, checkpoint, finish the current step if it fits the notice window, release. Job stays <code>queued</code> or goes straight to a new attempt.<br>
+Bound: ≤ one checkpoint interval of rework, plus whatever the new worker spends restoring.</p>
+<p><strong>Worker vanishes (OOM, kernel, no notice).</strong><br>
+Detect: <strong>heartbeat only.</strong> Assume the warning will not come.<br>
+Do: lease monitor marks the attempt <code>lost</code>, job <code>queued</code>, ready hint restored. New worker resumes from <code>latest_checkpoint_ref</code>.<br>
+Bound: 30s lease + restore. Tune lease to “fast detect” vs “do not false-positive a 2s blip.” 10s heartbeat / 30s lease is the spec I’d start from.</p>
+<p><strong>Network partition (split brain).</strong><br>
+Scheduler thinks the worker is dead; the worker is still rendering.<br>
+Do: expire lease, start attempt 2 with a <strong>new</strong> fencing token. Worker A’s complete is rejected. Worker B is the owner.<br>
+A’s MP4 may still land in S3 — it is not the artifact we publish unless the token matches. Delete orphans with a sweeper.</p>
+<p><strong>Stale complete after we already succeeded on attempt 2.</strong><br>
+Same token check. <code>complete</code> is idempotent for the <em>current</em> attempt only.</p>
+<p><strong>Redis empty or down.</strong><br>
+Running jobs keep heartbeating to Postgres. New scheduling: fall back to <code>SKIP LOCKED</code> on <code>queued</code> (degraded, slower) or pause <em>starts</em> while submits still 202. Rebuild hints from the outbox / from <code>queued</code> rows. Never treat Redis loss as job loss.</p>
+<p><strong>Postgres primary down.</strong><br>
+Fail over. Submits fail or wait — that is the 99.9% you actually spend money on (replicas, backups). Workers that already have a payload in memory can keep generating; they buffer heartbeats a few seconds. They cannot <code>complete</code> without the DB. If failover takes longer than the lease, the monitor on the new primary will requeue — fencing still applies when the old worker returns.</p>
+<p><strong>S3 checkpoint PUT fails.</strong><br>
+Retry with backoff. If it still fails, keep generating and log “running without a net.” Next preemption costs more rework. Do not fail the job because one checkpoint missed unless the product says so.</p>
+<p><strong>Checkpoint file is garbage.</strong><br>
+Fall back to previous object. None → restart from zero. Do not loop crash-restore.</p>
+<p><strong>SQS delivers the same <code>job_id</code> twice.</strong><br>
+First worker claims. Second <code>UPDATE … WHERE status = 'queued'</code> updates zero rows. Delete/ack the extra message. If we used SQS as source of truth, this is a double GPU bill.</p>
+<p><strong>Provider region dies.</strong><br>
+Jobs are in <em>our</em> Postgres, not in their queue. Mark workers <code>lost</code>. Requeue running jobs with checkpoints. Spin capacity in another region if the model artifacts are there. ETA jumps; we do not lose the 202s.</p>
+<p><strong>Fleet-wide reclaim (hundreds of spot VMs at once).</strong><br>
+Hundreds of checkpoints at once. Prefix-shard S3. A <strong>warm on-demand reserve</strong> (part of that 10% buffer) absorbs the dip while spot comes back. Queue depth is allowed to spike; admission control is what keeps submit alive.</p>
+<p><strong>Worker reports success, then crashes before we ack.</strong><br>
+Idempotent <code>complete</code>. Retry the RPC. Same artifact key.</p>
+<p><strong>Alice retries POST without the idempotency key.</strong><br>
+Two jobs. That is correct. The key is the dedupe; we do not guess.</p>
+<hr>
+<h2 id="13-progress-that-goes-backwards">13. Progress that goes backwards</h2>
+<p>If you show 85% and then preemption, a naive bar jumps to 0 then to 85. Say <strong>resuming from 85%</strong> (or skip the number and say processing). The GET payload can include <code>attempt_no</code> and <code>resumed_from_pct</code>. Webhooks fire from the outbox after the state change, not from the GPU thread.</p>
+<hr>
+<h2 id="14-when-this-gets-bigger">14. When this gets bigger</h2>
+<p>Sticky pools per <code>model_version</code> so warmth is the default.</p>
+<p>Spot vs on-demand: spot is cheaper and dies more. I would not pick a ratio in minute one without their cost numbers. I would say: on-demand (or reserved) for the SLA tier and a warm buffer; spot for the rest; <strong>checkpointing is what makes spot sane</strong>. A 90% spot fleet that gets half-reclaimed is a capacity incident, not a surprise.</p>
+<p>Multi-region: run the job near the GPUs; artifacts in-region; control plane can be global if the job row is the source of truth.</p>
+<p>Do not put Redis in front of <code>GET /video-generations/{id}</code> as the only copy of status. Cache if GET is hot; Postgres remains truth.</p>
+<hr>
+<h2 id="recap">Recap</h2>
+<p>Submit writes a job in Postgres before 202. Workers <strong>pull</strong>. A ready queue (Redis, or SQS as a wake-up) is a hint; the claim is a row lock and a <strong>JobAttempt</strong> with a <strong>fencing token</strong> and a 30-second lease. One video per GPU. Checkpoint about every 30 seconds so preemption wastes a bounded amount of work. Cancel is a state plus a token, not a polite wait for CUDA. When the pool is short, show ETA and stop pretending.</p>
+<p>The sentence that is the design: <strong>the GPU is not the source of truth.</strong> The job is. The attempt is how we retry. The token is how we ignore a ghost.</p> </div> </article>  <footer class="site-footer"> <div class="term-art"> <p class="term-prompt">haily@yevklnekqt:~$ ./beaver</p> <img class="term-pixel" src="/images/beaver.png?v=solid" width="64" height="40" alt=""> </div> <p class="footer-copy">
+© 2026 Haily Nguyen
+<span class="footer-links"> <a href="https://github.com/hailyngx" target="_blank" rel="noreferrer">GitHub</a> <a href="https://www.linkedin.com/in/haily-nguyen/" target="_blank" rel="noreferrer">LinkedIn</a> </span> </p> </footer> </div> <div class="portrait-view" data-portrait-view hidden> <img src="/images/haily.png" alt="Haily Nguyen"> </div> <script>
+      (function () {
+        var root = document.documentElement;
+        var button = document.querySelector("[data-theme-toggle]");
+        if (!button) return;
+
+        function label(theme) {
+          return theme === "night" ? "☀️" : "🌙";
+        }
+
+        function currentTheme() {
+          return root.getAttribute("data-theme") === "night" ? "night" : "day";
+        }
+
+        function apply(theme) {
+          root.setAttribute("data-theme", theme);
+          try {
+            localStorage.setItem("theme", theme);
+          } catch (e) {}
+          button.textContent = label(theme);
+          button.setAttribute(
+            "aria-label",
+            theme === "night" ? "Switch to day mode" : "Switch to night mode"
+          );
+        }
+
+        apply(currentTheme());
+        button.addEventListener("click", function () {
+          apply(currentTheme() === "night" ? "day" : "night");
+        });
+      })();
+    </script> <script>
+      (function () {
+        var openLink = document.querySelector("[data-portrait-open]");
+        var view = document.querySelector("[data-portrait-view]");
+        if (!openLink || !view) return;
+
+        function openView(event) {
+          event.preventDefault();
+          view.hidden = false;
+        }
+
+        function closeView() {
+          view.hidden = true;
+        }
+
+        openLink.addEventListener("click", openView);
+        view.addEventListener("click", closeView);
+        document.addEventListener("keydown", function (event) {
+          if (event.key === "Escape") closeView();
+        });
+      })();
+    </script> </body> </html>
