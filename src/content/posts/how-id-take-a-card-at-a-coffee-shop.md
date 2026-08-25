@@ -10,7 +10,7 @@ If you've seen a payment system drawn as a website checkout, it usually looks li
 
 At a register, someone taps a card for a latte. They might add a tip thirty seconds later. The approval has to come back while they are still at the counter. At 10pm the store sends that day's charges to the banks that actually pay them — not one Visa file.
 
-This note walks through that system in the order I'd teach it. We start with one latte so the words mean something. Then we look at the records, the API, and the states. After that: why the tap stays live, how we keep the card number off our servers, how retries don't double-charge, how the ledger works, how the 10pm files actually get built, and how we tell the rest of the store without blocking the receipt.
+This note walks through that system in the order I'd teach it. We start with one latte so the words mean something. Then we look at the records — they live in a relational database — the API, and the states. After that: why the tap stays live, how we keep the card number off our servers, how retries don't double-charge, how the ledger works, how the 10pm files actually get built, and how we tell the rest of the store without blocking the receipt.
 
 ---
 
@@ -100,6 +100,17 @@ Attempt      one call to a bank
 ```
 
 Never put card number, expiry, or CVC on `Payment`. We'll come back to why.
+
+These rows live in a **relational database** (Postgres is the one I'd pick). That is not a default box on a template. Payments need:
+
+- **One transaction, several writes.** Move the payment to `captured` and write two ledger rows that sum to zero. If those can commit separately, the books already lie. A relational store gives you `BEGIN … COMMIT` across tables.
+- **Keys the database enforces.** Unique on `(merchant_id, idempotency_key)` so two machines cannot insert the same retry. Foreign key from `Attempt.payment_id` to `Payment`, so you cannot record a bank call for a payment that does not exist.
+- **Legal states in the schema.** A check constraint or an enum so `created → settled` is impossible even if the handler has a bug.
+- **Reads that join.** Support asks "show me this latte and every time we talked to the bank." That is `Payment` plus its `Attempt` rows, not a scavenger hunt across logs.
+
+A document store or a wide-column store can hold JSON. They make the *next* sentence hard: "those four writes either all happened or none did." Redis can cache the idempotency lookup. It is not the source of truth for money. If Redis restarts, the unique row in Postgres is still there.
+
+I would not start on a ledger in Kafka, or on a database that only offers eventual consistency for the tap. Eventual is for the receipt email.
 
 ---
 
@@ -215,13 +226,13 @@ Some designs put step 3 on a queue: the API returns, a worker calls the bank lat
                                       |                    Acquirer B
                                       |  record every step
                                       v
-                                Postgres (keyed by store)
+                                Relational DB (Postgres, keyed by store)
                                 Ledger (two rows, sum 0)
 
   Later: 10pm files, webhooks to the store's back office
 ```
 
-Postgres is enough. You want one database transaction for "move to `captured` and write two ledger rows." If those can diverge, your books are already lying.
+A relational database is enough. You want one ACID transaction for "move to `captured` and write two ledger rows." If those can diverge, your books are already lying. Postgres (or MySQL, same idea) is that box. I would not put the tap's source of truth in a queue or a cache.
 
 ---
 
@@ -462,6 +473,6 @@ Global: authorize near the store. Keep settlement files in-region (residency rul
 
 ## Recap
 
-Start from the counter. Hold is live and safe to retry. Capture is live and safe to retry. The card number never sat on our server. Settle is tonight, grouped by the bank that pays us. Recon is comparing two lists. Webhooks leave after the receipt is already printed.
+Start from the counter. The tap's source of truth is a relational database: one transaction for the payment, the attempts, and two ledger rows. Hold is live and safe to retry. Capture is live and safe to retry. The card number never sat on our server. Settle is tonight, grouped by the bank that pays us. Recon is comparing two lists. Webhooks leave after the receipt is already printed.
 
 If a box doesn't help one of those, it doesn't belong on the till.
