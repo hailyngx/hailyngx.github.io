@@ -12,6 +12,8 @@ Generation takes minutes. The public request cannot sit open until the file exis
 
 This is the order I'd teach it. One job so the words mean something. Then the records — a job is not an attempt — the API, and why we persist before we say accepted. After that: which queue, pull vs push, the lease and the fencing token, checkpoints, cancel, and what we do when there are no GPUs left. Last, the failure cases one by one. That last section is the design.
 
+[![Whiteboard for a Sora-like scheduler: requirements, job vs attempt, and a pull-based GPU pool with Postgres as the source of truth](/images/sora-architecture.png)](/images/sora-architecture.png)
+
 ---
 
 ## 1. One video, start to finish
