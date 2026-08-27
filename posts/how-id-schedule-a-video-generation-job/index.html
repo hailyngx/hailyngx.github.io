@@ -18,6 +18,7 @@
 </button> </div> </header>  <article> <header class="article-header"> <h1>How I&#39;d design Sora</h1> <p class="post-meta">August 25, 2026</p> </header> <div class="prose"> <p>Sora looks like a prompt and an MP4. The product is: take the job, put it on a GPU, survive the GPU disappearing, and never run the same video twice.</p>
 <p>Generation takes minutes. The public request cannot sit open until the file exists. The pool is not a web fleet — one worker, one video, and the machine may be a spot instance that dies with a two-minute warning or with none. Prompt safety, billing, and moderation sit upstream. This note is the scheduler, the worker, and every way that pair fails.</p>
 <p>This is the order I’d teach it. One job so the words mean something. Then the records — a job is not an attempt — the API, and why we persist before we say accepted. After that: which queue, pull vs push, the lease and the fencing token, checkpoints, cancel, and what we do when there are no GPUs left. Last, the failure cases one by one. That last section is the design.</p>
+<p><a href="/images/sora-architecture.png"><img src="/images/sora-architecture.png" alt="Whiteboard for a Sora-like scheduler: requirements, job vs attempt, and a pull-based GPU pool with Postgres as the source of truth"></a></p>
 <hr>
 <h2 id="1-one-video-start-to-finish">1. One video, start to finish</h2>
 <p>Alice wants ten seconds, 720p, model <code>sora-v1</code>. “Drone shot over a snowy mountain at sunrise.”</p>
